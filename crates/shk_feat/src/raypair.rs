@@ -17,8 +17,8 @@ const EMPTY: u8 = u8::MAX;
 /// ライン上に直前の駒がないことを表す
 const NONE: u8 = u8::MAX;
 
-/// 距離 d（1..=8）を距離区分 db に変換する表（§F2.1）。添字 0 は使わない。
-const DB: [u32; 9] = [0, 0, 1, 2, 2, 3, 3, 3, 3];
+/// 距離 d（1..=8）を距離区分 db に変換する表（§F2.1）。添字は `d & 15` で引く（9 以上は使わない）。
+const DB: [u32; 16] = [0, 0, 1, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3];
 
 /// ラインの数（行 9、列 9、斜め 17、斜め 17）
 const N_LINES: usize = 52;
@@ -133,20 +133,61 @@ pub fn features(pos: &Position, persp: u8, version: u8) -> Result<Vec<u32>, Stri
     Ok(out)
 }
 
-/// `features` と同じ結果を `out` に書く（`out` の中身は消える）。`out` を使い回せば確保は起きない。
-pub fn features_into(pos: &Position, persp: u8, version: u8, out: &mut Vec<u32>) -> Result<(), String> {
-    let regions = region_count(version)?;
-    let board = view_of(pos, persp);
-    // 駒のあるマスを、視点座標の昇順に並べたもの（ラインの走査順と同じ向き）
-    let mut occ = [(0u8, 0u8); 81];
-    let mut n_occ = 0;
-    for (sq, &pc) in board.iter().enumerate() {
-        if pc != EMPTY {
-            occ[n_occ] = (sq as u8, pc);
-            n_occ += 1;
+/// 局面の駒の一覧。盤の昇順（`sq = y * 9 + x` の小さい順）に並ぶ。
+/// 両視点の特徴を作るとき、局面ごとに1回だけ作って使い回す。
+pub struct Pieces {
+    /// `(sq, color, pt)`。`sq` は手番に依らない盤の番号
+    items: [(u8, u8, u8); 81],
+    n: usize,
+    hands: [[u8; 7]; 2],
+}
+
+impl Pieces {
+    pub fn new(pos: &Position) -> Self {
+        let mut items = [(0, 0, 0); 81];
+        let mut n = 0;
+        for y in 0..9 {
+            for x in 0..9 {
+                if let Some(p) = pos.board[y][x] {
+                    items[n] = ((y * 9 + x) as u8, p.color, p.pt);
+                    n += 1;
+                }
+            }
+        }
+        Pieces {
+            items,
+            n,
+            hands: pos.hands,
         }
     }
-    let occ = &occ[..n_occ];
+}
+
+/// `features` と同じ結果を `out` に書く（`out` の中身は消える）。`out` を使い回せば確保は起きない。
+pub fn features_into(pos: &Position, persp: u8, version: u8, out: &mut Vec<u32>) -> Result<(), String> {
+    features_from(&Pieces::new(pos), persp, version, out)
+}
+
+/// `Pieces` から視点 `persp` の特徴を `out` に書く（`features_into` と同じ結果）。
+pub fn features_from(pieces: &Pieces, persp: u8, version: u8, out: &mut Vec<u32>) -> Result<(), String> {
+    let regions = region_count(version)?;
+    let n = pieces.n;
+
+    // 視点座標の駒。後手視点は盤を 180° 回すので、昇順に並べ直すには列を逆から読む。
+    let mut occ = [(0u8, 0u8); 81];
+    let mut board = [EMPTY; 81];
+    for i in 0..n {
+        let (sq, color, pt) = if persp == 0 {
+            pieces.items[i]
+        } else {
+            pieces.items[n - 1 - i]
+        };
+        let vsq = if persp == 0 { sq } else { 80 - sq };
+        // 駒番号 `pc` は §F1.3（相手側は +14）
+        let code = pt + if color == persp { 0 } else { 14 };
+        occ[i] = (vsq, code);
+        board[vsq as usize] = code;
+    }
+    let occ = &occ[..n];
     out.clear();
 
     // A1：盤上の駒（玉を含む）
@@ -155,7 +196,7 @@ pub fn features_into(pos: &Position, persp: u8, version: u8, out: &mut Vec<u32>)
     }
 
     // A2：持ち駒（side 0 = 視点側、1 = 相手側）
-    let hands = [pos.hands[persp as usize], pos.hands[1 - persp as usize]];
+    let hands = [pieces.hands[persp as usize], pieces.hands[1 - persp as usize]];
     for (side, hand) in hands.iter().enumerate() {
         for h in 0..7 {
             if hand[h] > HAND_MAX[h] {
@@ -168,27 +209,36 @@ pub fn features_into(pos: &Position, persp: u8, version: u8, out: &mut Vec<u32>)
     }
 
     // B1：ライン上で隣接する駒の対（§F2.1 の走査規則）。
-    // 占有マスを昇順に見ると、どの軸のラインも手前 → 奥の順に現れる。
+    // 駒を昇順に見ると、どの軸のラインも手前 → 奥の順に現れる。
     // 各ラインについて直前の駒を覚えておき、今の駒との組を出す。
+    // 組があるかどうかで分岐すると予測が外れやすいので、組でない場合も書いて、件数だけ数えない。
     let v1 = version == 1;
+    let mut pairs = [0u32; 4 * 81];
+    let mut np = 0;
     let mut last = [NONE; N_LINES];
     for &(sq, pb) in occ {
         let s = sq as usize;
         for axis in 0..4 {
             let line = LINES.of_sq[axis][s] as usize;
             let prev = last[line];
-            if prev != NONE {
-                let sa = prev as usize;
-                let pa = board[sa] as u32;
-                let (ya, xa) = (sa / 9, sa % 9);
-                let d = if axis == 1 { s % 9 - xa } else { s / 9 - ya };
-                let local = pa * 448 + pb as u32 * 16 + axis as u32 * 4 + DB[d];
-                let region = if v1 { ((ya / 3) * 3 + xa / 3) as u32 } else { 0 };
-                out.push(B1_BASE + region * B1_LOCAL + local);
-            }
+            let valid = prev != NONE;
+            // 直前の駒がないときは自分自身を参照する（書いた値は数えないので使わない）
+            let sa = if valid { prev as usize } else { s };
+            let (ya, xa) = (sa / 9, sa % 9);
+            let d = if axis == 1 {
+                (s % 9).wrapping_sub(xa)
+            } else {
+                (s / 9).wrapping_sub(ya)
+            };
+            let pa = board[sa] as u32;
+            let local = pa * 448 + pb as u32 * 16 + axis as u32 * 4 + DB[d & 15];
+            let region = if v1 { ((ya / 3) * 3 + xa / 3) as u32 } else { 0 };
+            pairs[np] = B1_BASE + region * B1_LOCAL + local;
+            np += valid as usize;
             last[line] = sq;
         }
     }
+    out.extend_from_slice(&pairs[..np]);
 
     // B2：成っていない桂の利き先にある駒
     let b2 = B1_BASE + regions * B1_LOCAL;
@@ -249,20 +299,4 @@ fn radix_pass(src: &[u32], dst: &mut [u32], shift: u32) {
         dst[start[b]] = x;
         start[b] += 1;
     }
-}
-
-/// 視点座標に変換した盤面（`sq = y * 9 + x`）。駒番号 `pc` は §F1.3（相手側は +14）。
-fn view_of(pos: &Position, persp: u8) -> [u8; 81] {
-    let mut vb = [EMPTY; 81];
-    for y in 0..9 {
-        for x in 0..9 {
-            if let Some(p) = pos.board[y][x] {
-                // 視点が後手のときは盤を 180° 回す（(y, x) → (8 − y, 8 − x)）
-                let sq = if persp == 0 { y * 9 + x } else { 80 - (y * 9 + x) };
-                let side = if p.color == persp { 0 } else { 14 };
-                vb[sq] = p.pt + side;
-            }
-        }
-    }
-    vb
 }

@@ -101,11 +101,12 @@ pub(crate) fn features_of(raw: &[u8], version: u8) -> Result<Features, String> {
         }
         let stm = pos.stm;
         let nstm = 1 - stm;
+        let pieces = raypair::Pieces::new(&pos);
         f.stm_off.push(f.stm_idx.len() as i64);
-        raypair::features_into(&pos, stm, version, &mut buf)?;
+        raypair::features_from(&pieces, stm, version, &mut buf)?;
         f.stm_idx.extend(buf.iter().map(|&i| i as i64));
         f.nstm_off.push(f.nstm_idx.len() as i64);
-        raypair::features_into(&pos, nstm, version, &mut buf)?;
+        raypair::features_from(&pieces, nstm, version, &mut buf)?;
         f.nstm_idx.extend(buf.iter().map(|&i| i as i64));
         f.score.push(score as f32);
         f.result.push((result as f32 + 1.0) * 0.5);

@@ -242,6 +242,7 @@ class Trainer:
         self.ckpt_path = os.path.join(self.out_dir, "checkpoint.pt")
         self.lam = float(t["lam"])
         self.paths = train_paths(d)
+        self.saved_step = -1
 
         ck = None
         if os.path.exists(self.ckpt_path):
@@ -359,6 +360,7 @@ class Trainer:
         torch.save(state, tmp)
         os.replace(tmp, self.ckpt_path)  # 途中で切れても古い checkpoint.pt が残るように改名で置き換える
         self.last_save = time.monotonic()
+        self.saved_step = self.step
         self.log.write({"type": "save", "step": self.step, "epoch": self.epoch, "reason": reason})
         self._emit_cache()
 
@@ -410,7 +412,8 @@ class Trainer:
             if periodic or time.monotonic() - self.last_save >= save_interval:
                 self.save("periodic")
 
-        self.save("final")
+        if self.saved_step != self.step:
+            self.save("final")
         self.log.write({"type": "end", "step": self.step, "epoch": self.epoch,
                         "elapsed_sec": time.monotonic() - self.t0})
         self.log.close()

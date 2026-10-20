@@ -37,3 +37,22 @@ python -m pytest -q tests
 ### 変更禁止
 
 `docs/`、`reference/`、`tests/`、`PROTECTED.sha256`、`check_protected.py` は変更禁止。確認は `python check_protected.py`。
+
+## M3：学習ループ（`shikibu`）
+
+`python/shikibu/` の Python パッケージ。`shikibu_feat`（M1・M2）でデータを読み、PyTorch で学習する。
+
+### 学習
+
+```
+PYTHONPATH=python python -m shikibu.train --config configs/colab_v0.toml            # 最初から
+PYTHONPATH=python python -m shikibu.train --config configs/colab_v0.toml --resume   # checkpoint.pt から続ける
+```
+
+- 設定は TOML（`configs/colab_v0.toml`、`configs/colab_v1.toml` が例）。
+- 出力は `output.out_dir` に `checkpoint.pt`（最新の保存）と `log.jsonl`（1行1 JSON）。
+- Colab での実行手順は `notebooks/colab_train.ipynb`。
+
+### 変更禁止
+
+`tests/m3_data.py` と `tests/test_m3_acceptance.py` は変更禁止（キットで配置）。

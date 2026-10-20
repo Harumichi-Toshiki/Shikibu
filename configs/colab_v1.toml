@@ -1,0 +1,42 @@
+# Colab（L4）で RayPair_v1Network を学習する設定。データは Drive、キャッシュはローカル SSD。
+# 出力先（Drive）：/content/drive/MyDrive/shikibu/runs/colab_v1/
+# max_steps は1セッションで終わる量（この値は初期値。ノートブックで上書きできる）。total_steps は40億局面1周ぶん（16384 × 244,000 ≈ 40億）。
+# 学習率などは初期値。実測のあとで調整する。
+
+[data]
+# 学習用シャード。検証用の1つ（最後のシャード）は shard_val.psv という名前にして学習から外す。
+train_glob = "/content/drive/MyDrive/shikibu/shards/shard_[0-9]*.psv"
+val_path = "/content/drive/MyDrive/shikibu/shards/shard_val.psv"
+cache_dir = "/content/shk_cache"
+max_cached = 3
+shuffle_buffer = 0
+num_threads = 11
+
+[model]
+network = "RayPair_v1Network"
+ft_width = 128
+
+[train]
+batch_size = 16384
+lr = 1e-3
+weight_decay = 1e-4
+warmup_steps = 1000
+total_steps = 244000
+max_steps = 30000
+min_lr_ratio = 0.01
+lam = 0.75
+eval_scale = "auto"
+scale_sample = 10000000
+allow_missing_results = false
+seed = 0
+device = "auto"
+torch_threads = 1
+deterministic = false
+save_every_steps = 0
+save_every_minutes = 30.0
+val_every_steps = 2000
+val_positions = 100000
+log_every_steps = 100
+
+[output]
+out_dir = "/content/drive/MyDrive/shikibu/runs/colab_v1"

@@ -8,6 +8,7 @@ use pyo3::prelude::*;
 mod position;
 mod psv;
 mod raypair;
+mod loader;
 mod rng;
 mod shuffle;
 mod stats;
@@ -90,5 +91,6 @@ fn shikibu_feat(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(stats::psv_stats, m)?)?;
     m.add_function(wrap_pyfunction!(stats::estimate_eval_scale, m)?)?;
     m.add_function(wrap_pyfunction!(shuffle_shards, m)?)?;
+    m.add_class::<loader::BatchLoader>()?;
     Ok(())
 }

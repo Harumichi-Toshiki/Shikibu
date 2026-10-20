@@ -9,6 +9,7 @@ mod position;
 mod psv;
 mod raypair;
 mod rng;
+mod shuffle;
 mod stats;
 
 fn to_py_err(msg: String) -> PyErr {
@@ -64,6 +65,22 @@ fn extract_psv(rec: &[u8], perspective: i64, version: i64) -> PyResult<Vec<u32>>
     raypair::features(&pos, persp, version).map_err(to_py_err)
 }
 
+/// 全局面をシャッフルしてシャードに分割する（§S3.1）。出力はシャードのパス（昇順）。
+#[pyfunction]
+fn shuffle_shards(
+    py: Python<'_>,
+    inputs: Vec<String>,
+    out_dir: String,
+    records_per_shard: u64,
+    seed: u64,
+    mem_limit_mb: u64,
+) -> PyResult<Vec<String>> {
+    py.allow_threads(|| {
+        shuffle::shuffle_shards(&inputs, &out_dir, records_per_shard, seed, mem_limit_mb)
+    })
+    .map_err(to_py_err)
+}
+
 #[pymodule]
 fn shikibu_feat(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(num_features, m)?)?;
@@ -72,5 +89,6 @@ fn shikibu_feat(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(extract_psv, m)?)?;
     m.add_function(wrap_pyfunction!(stats::psv_stats, m)?)?;
     m.add_function(wrap_pyfunction!(stats::estimate_eval_scale, m)?)?;
+    m.add_function(wrap_pyfunction!(shuffle_shards, m)?)?;
     Ok(())
 }

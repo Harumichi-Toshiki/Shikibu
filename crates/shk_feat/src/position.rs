@@ -215,14 +215,14 @@ pub fn decode_psfen(data: &[u8]) -> Result<Position, String> {
         if king_sq.contains(&sq) {
             continue;
         }
-        if let Some((color, pt)) = r.read_code(BOARD_CODES)? {
+        if let Some((color, pt)) = r.read_lut(&BOARD_LUT)? {
             let (y, x) = cshogi_sq_to_yx(sq);
             pos.board[y][x] = Some(Piece { color, pt });
         }
     }
 
     while r.pos < 256 {
-        if let Some((color, h)) = r.read_code(HAND_CODES)? {
+        if let Some((color, h)) = r.read_lut(&HAND_LUT)? {
             let n = &mut pos.hands[color as usize][h as usize];
             *n = n.checked_add(1).ok_or("持ち駒が多すぎる")?;
         }
@@ -310,6 +310,41 @@ const HAND_CODES: &[Code] = &[
     (63, 7, None),
 ];
 
+/// 符号の引き表の1項目。`len` は符号のビット数（0 は、8 ビット読んでも一致しないこと）。
+#[derive(Clone, Copy)]
+struct Lut {
+    len: u8,
+    piece: Option<(u8, u8)>,
+}
+
+/// 符号表から 8 ビットの先読みで引く表を作る。`lut[v]` は、下位ビットから読んだ `v` に対して
+/// 最も短く一致する符号。これは 1 ビットずつ照合する読み方と同じ結果になる。
+const fn build_lut(table: &[Code]) -> [Lut; 256] {
+    let mut lut = [Lut { len: 0, piece: None }; 256];
+    let mut len = 1u8;
+    while len <= 8 {
+        let mut i = 0;
+        while i < table.len() {
+            let (value, l, piece) = table[i];
+            if l == len {
+                let mut v = value as usize;
+                while v < 256 {
+                    if lut[v].len == 0 {
+                        lut[v] = Lut { len, piece };
+                    }
+                    v += 1 << len;
+                }
+            }
+            i += 1;
+        }
+        len += 1;
+    }
+    lut
+}
+
+static BOARD_LUT: [Lut; 256] = build_lut(BOARD_CODES);
+static HAND_LUT: [Lut; 256] = build_lut(HAND_CODES);
+
 struct BitReader<'a> {
     data: &'a [u8],
     pos: usize,
@@ -334,15 +369,37 @@ impl BitReader<'_> {
         Ok(v)
     }
 
-    /// 符号表に一致するまで 1 ビットずつ読む。符号は下位ビットから並ぶ。
-    fn read_code(&mut self, table: &[Code]) -> Result<Option<(u8, u8)>, String> {
-        let mut value = 0u32;
-        for len in 1..=8u8 {
-            value |= (self.bit()? as u32) << (len - 1);
-            if let Some(&(_, _, piece)) = table.iter().find(|e| e.1 == len && e.0 as u32 == value) {
-                return Ok(piece);
-            }
+    /// 8 ビット先読みで符号を1つ読む。符号は下位ビットから並ぶ。
+    fn read_lut(&mut self, lut: &[Lut; 256]) -> Result<Option<(u8, u8)>, String> {
+        if self.pos >= 256 {
+            return Err("PackedSfen のビット列が途中で終わった".into());
         }
-        Err("不正なハフマン符号".into())
+        let avail = 256 - self.pos;
+        let e = lut[self.peek8()];
+        if e.len == 0 {
+            // 8 ビット読んでも一致しない（残りが 8 ビット未満なら、途中で終わったのと同じ）
+            return Err(if avail >= 8 {
+                "不正なハフマン符号".into()
+            } else {
+                "PackedSfen のビット列が途中で終わった".into()
+            });
+        }
+        if e.len as usize > avail {
+            return Err("PackedSfen のビット列が途中で終わった".into());
+        }
+        self.pos += e.len as usize;
+        Ok(e.piece)
+    }
+
+    /// 次の 8 ビットを、下位から並べた整数として返す。256 ビットの外は 0 とみなす。
+    fn peek8(&self) -> usize {
+        let byte = self.pos / 8;
+        let lo = self.data[byte] as u32;
+        let hi = if byte + 1 < self.data.len() {
+            self.data[byte + 1] as u32
+        } else {
+            0
+        };
+        (((hi << 8) | lo) >> (self.pos % 8) & 0xFF) as usize
     }
 }

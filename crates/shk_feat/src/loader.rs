@@ -34,6 +34,8 @@ use crate::rng::Rng;
 
 /// コピーしたファイルの名前の接頭辞。cache_dir の中で、この接頭辞のファイルだけを消す。
 const CACHE_PREFIX: &str = "shk_cache_";
+/// 1局面の特徴数の目安（作業領域と出力の確保に使う）
+const FEATS_PER_POS: usize = 128;
 /// 条件変数を待つ間隔（停止の合図を取りこぼさないため）。
 const POLL: Duration = Duration::from_millis(50);
 
@@ -81,14 +83,17 @@ pub(crate) struct Features {
 }
 
 pub(crate) fn features_of(raw: &[u8], version: u8) -> Result<Features, String> {
+    let n = raw.len() / REC;
+    // 1局面あたり両視点で約 130 個（盤上の駒と持ち駒、隣接する駒の対）
     let mut f = Features {
-        stm_idx: Vec::new(),
-        stm_off: Vec::new(),
-        nstm_idx: Vec::new(),
-        nstm_off: Vec::new(),
-        score: Vec::new(),
-        result: Vec::new(),
+        stm_idx: Vec::with_capacity(n * FEATS_PER_POS),
+        stm_off: Vec::with_capacity(n),
+        nstm_idx: Vec::with_capacity(n * FEATS_PER_POS),
+        nstm_off: Vec::with_capacity(n),
+        score: Vec::with_capacity(n),
+        result: Vec::with_capacity(n),
     };
+    let mut buf: Vec<u32> = Vec::with_capacity(FEATS_PER_POS);
     for rec in raw.chunks_exact(REC) {
         let (pos, score, _, _, result) = position::decode_psv(rec)?;
         if !(-1..=1).contains(&result) {
@@ -97,11 +102,11 @@ pub(crate) fn features_of(raw: &[u8], version: u8) -> Result<Features, String> {
         let stm = pos.stm;
         let nstm = 1 - stm;
         f.stm_off.push(f.stm_idx.len() as i64);
-        f.stm_idx
-            .extend(raypair::features(&pos, stm, version)?.into_iter().map(|i| i as i64));
+        raypair::features_into(&pos, stm, version, &mut buf)?;
+        f.stm_idx.extend(buf.iter().map(|&i| i as i64));
         f.nstm_off.push(f.nstm_idx.len() as i64);
-        f.nstm_idx
-            .extend(raypair::features(&pos, nstm, version)?.into_iter().map(|i| i as i64));
+        raypair::features_into(&pos, nstm, version, &mut buf)?;
+        f.nstm_idx.extend(buf.iter().map(|&i| i as i64));
         f.score.push(score as f32);
         f.result.push((result as f32 + 1.0) * 0.5);
     }

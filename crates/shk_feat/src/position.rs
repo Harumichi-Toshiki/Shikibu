@@ -370,6 +370,7 @@ impl BitReader<'_> {
     }
 
     /// 8 ビット先読みで符号を1つ読む。符号は下位ビットから並ぶ。
+    #[inline(always)]
     fn read_lut(&mut self, lut: &[Lut; 256]) -> Result<Option<(u8, u8)>, String> {
         if self.pos >= 256 {
             return Err("PackedSfen のビット列が途中で終わった".into());
@@ -392,6 +393,7 @@ impl BitReader<'_> {
     }
 
     /// 次の 8 ビットを、下位から並べた整数として返す。256 ビットの外は 0 とみなす。
+    #[inline(always)]
     fn peek8(&self) -> usize {
         let byte = self.pos / 8;
         let lo = self.data[byte] as u32;

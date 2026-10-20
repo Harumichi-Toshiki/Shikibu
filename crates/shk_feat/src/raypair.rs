@@ -2,7 +2,7 @@
 //!
 //! 計算は作業領域を使い回す（`features_into`）。ラインは定数表で持ち、局面ごとに確保しない。
 
-use crate::position::Position;
+use crate::position::{Piece, Position};
 
 const A2_BASE: u32 = 2268;
 const B1_BASE: u32 = 2344;
@@ -22,6 +22,31 @@ const DB: [u32; 16] = [0, 0, 1, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3];
 
 /// ラインの数（行 9、列 9、斜め 17、斜め 17）
 const N_LINES: usize = 52;
+
+/// マスの行・列・3×3 領域（§F2.2）。B1 の計算で割り算をしないための表。
+#[derive(Clone, Copy)]
+struct Sq {
+    row: u8,
+    col: u8,
+    region: u8,
+}
+
+static SQS: [Sq; 81] = build_sqs();
+
+const fn build_sqs() -> [Sq; 81] {
+    let mut out = [Sq { row: 0, col: 0, region: 0 }; 81];
+    let mut sq = 0;
+    while sq < 81 {
+        let (y, x) = (sq / 9, sq % 9);
+        out[sq] = Sq {
+            row: y as u8,
+            col: x as u8,
+            region: ((y / 3) * 3 + x / 3) as u8,
+        };
+        sq += 1;
+    }
+    out
+}
 
 /// 軸ごとのライン（§F2.1 の走査規則）。マスは `y * 9 + x` で、並びは手前 → 奥。
 struct Lines {
@@ -148,10 +173,11 @@ impl Pieces {
         let mut n = 0;
         for y in 0..9 {
             for x in 0..9 {
-                if let Some(p) = pos.board[y][x] {
-                    items[n] = ((y * 9 + x) as u8, p.color, p.pt);
-                    n += 1;
-                }
+                // 駒の有無で分岐せず、常に書いて、駒があるときだけ件数を進める
+                let cell = pos.board[y][x];
+                let p = cell.unwrap_or(Piece { color: 0, pt: 0 });
+                items[n] = ((y * 9 + x) as u8, p.color, p.pt);
+                n += cell.is_some() as usize;
             }
         }
         Pieces {
@@ -218,21 +244,22 @@ pub fn features_from(pieces: &Pieces, persp: u8, version: u8, out: &mut Vec<u32>
     let mut last = [NONE; N_LINES];
     for &(sq, pb) in occ {
         let s = sq as usize;
+        let cur = SQS[s];
         for axis in 0..4 {
             let line = LINES.of_sq[axis][s] as usize;
             let prev = last[line];
             let valid = prev != NONE;
             // 直前の駒がないときは自分自身を参照する（書いた値は数えないので使わない）
-            let sa = if valid { prev as usize } else { s };
-            let (ya, xa) = (sa / 9, sa % 9);
+            let pi = if valid { prev as usize } else { s };
+            let before = SQS[pi];
             let d = if axis == 1 {
-                (s % 9).wrapping_sub(xa)
+                cur.col.wrapping_sub(before.col)
             } else {
-                (s / 9).wrapping_sub(ya)
+                cur.row.wrapping_sub(before.row)
             };
-            let pa = board[sa] as u32;
-            let local = pa * 448 + pb as u32 * 16 + axis as u32 * 4 + DB[d & 15];
-            let region = if v1 { ((ya / 3) * 3 + xa / 3) as u32 } else { 0 };
+            let pa = board[pi] as u32;
+            let local = pa * 448 + pb as u32 * 16 + axis as u32 * 4 + DB[(d & 15) as usize];
+            let region = if v1 { before.region as u32 } else { 0 };
             pairs[np] = B1_BASE + region * B1_LOCAL + local;
             np += valid as usize;
             last[line] = sq;
@@ -268,32 +295,43 @@ pub fn features_from(pieces: &Pieces, persp: u8, version: u8, out: &mut Vec<u32>
 const SORT_STACK: usize = 256;
 
 /// 特徴の値は 2^18 未満なので、6 ビットずつ 3 回の基数ソートで昇順にする。
+/// 3 回ぶんのヒストグラムは、値を 1 回走査して同時に作る。
 fn sort_features(v: &mut Vec<u32>) {
     let n = v.len();
-    if n > SORT_STACK || v.iter().any(|&x| x >= 1 << 18) {
+    if n > SORT_STACK {
         v.sort_unstable();
         return;
     }
+    let mut hist = [[0usize; 64]; 3];
+    let mut acc = 0u32;
+    for &x in v.iter() {
+        acc |= x;
+        hist[0][(x & 63) as usize] += 1;
+        hist[1][((x >> 6) & 63) as usize] += 1;
+        hist[2][((x >> 12) & 63) as usize] += 1;
+    }
+    if acc >> 18 != 0 {
+        v.sort_unstable();
+        return;
+    }
+    for h in hist.iter_mut() {
+        let mut sum = 0;
+        for c in h.iter_mut() {
+            let k = *c;
+            *c = sum;
+            sum += k;
+        }
+    }
     let mut tmp = [0u32; SORT_STACK];
     let tmp = &mut tmp[..n];
-    radix_pass(v, tmp, 0);
-    radix_pass(tmp, v, 6);
-    radix_pass(v, tmp, 12);
+    scatter(v, tmp, &mut hist[0], 0);
+    scatter(tmp, v, &mut hist[1], 6);
+    scatter(v, tmp, &mut hist[2], 12);
     v.copy_from_slice(tmp);
 }
 
-/// `src` を `(x >> shift) & 63` の順に `dst` へ安定に並べ替える。
-fn radix_pass(src: &[u32], dst: &mut [u32], shift: u32) {
-    let mut start = [0usize; 64];
-    for &x in src {
-        start[((x >> shift) & 63) as usize] += 1;
-    }
-    let mut sum = 0;
-    for c in start.iter_mut() {
-        let k = *c;
-        *c = sum;
-        sum += k;
-    }
+/// `src` を `(x >> shift) & 63` の順に `dst` へ安定に並べ替える。`start` は各バケツの先頭位置。
+fn scatter(src: &[u32], dst: &mut [u32], start: &mut [usize; 64], shift: u32) {
     for &x in src {
         let b = ((x >> shift) & 63) as usize;
         dst[start[b]] = x;

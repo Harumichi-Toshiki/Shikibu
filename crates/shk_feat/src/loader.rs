@@ -20,12 +20,12 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use numpy::IntoPyArray;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyList};
 
 use crate::position;
 use crate::psv::{self, REC};
@@ -125,12 +125,21 @@ struct CacheState {
     stop: bool,
 }
 
+/// 1ファイルのコピーの記録（`cache_stats` で返す）。
+struct CopyStat {
+    file: String,
+    bytes: u64,
+    seconds: f64,
+}
+
 struct CacheHub {
     dir: PathBuf,
     /// 同時にあってよいファイル数（max_cached + 1）
     cap: usize,
     state: Mutex<CacheState>,
     cv: Condvar,
+    /// コピーしたファイルごとの記録（コピーが済んだ順）
+    stats: Mutex<Vec<CopyStat>>,
 }
 
 impl CacheHub {
@@ -145,6 +154,7 @@ impl CacheHub {
                 stop: false,
             }),
             cv: Condvar::new(),
+            stats: Mutex::new(Vec::new()),
         }
     }
 
@@ -185,10 +195,19 @@ fn copy_ahead(paths: Arc<Vec<PathBuf>>, first: usize, hub: Arc<CacheHub>) {
         let dst = hub.dir.join(&name);
         // 途中のファイルは .part の名前で作り、揃ってから本名にする
         let part = hub.dir.join(format!("{name}.part"));
-        let res = fs::copy(&paths[idx], &part).and_then(|_| fs::rename(&part, &dst));
+        let started = Instant::now();
+        let res = fs::copy(&paths[idx], &part).and_then(|n| fs::rename(&part, &dst).map(|_| n));
+        let seconds = started.elapsed().as_secs_f64();
         let mut st = lock(&hub.state);
         match res {
-            Ok(()) => st.ready.push_back(idx),
+            Ok(bytes) => {
+                let file = paths[idx]
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                lock(&hub.stats).push(CopyStat { file, bytes, seconds });
+                st.ready.push_back(idx)
+            }
             Err(e) => st.error = Some(format!("{}: コピー失敗: {e}", paths[idx].display())),
         }
         hub.cv.notify_all();
@@ -584,6 +603,23 @@ impl BatchLoader {
 
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
+    }
+
+    /// `cache_dir` へのコピーの記録。ファイルごとに `{"file", "bytes", "seconds", "mb_per_s"}` の dict を
+    /// コピーが済んだ順に返す（MB は 10⁶ バイト）。`cache_dir` を指定していなければ空のリスト。
+    fn cache_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let list = PyList::empty(py);
+        if let Some(hub) = &self.cache {
+            for s in lock(&hub.stats).iter() {
+                let d = PyDict::new(py);
+                d.set_item("file", &s.file)?;
+                d.set_item("bytes", s.bytes)?;
+                d.set_item("seconds", s.seconds)?;
+                d.set_item("mb_per_s", s.bytes as f64 / 1e6 / s.seconds.max(1e-9))?;
+                list.append(d)?;
+            }
+        }
+        Ok(list)
     }
 
     fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {

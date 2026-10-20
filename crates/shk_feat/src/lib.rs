@@ -6,7 +6,10 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 mod position;
+mod psv;
 mod raypair;
+mod rng;
+mod stats;
 
 fn to_py_err(msg: String) -> PyErr {
     PyValueError::new_err(msg)
@@ -67,5 +70,7 @@ fn shikibu_feat(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(extract_sfen, m)?)?;
     m.add_function(wrap_pyfunction!(decode_psv, m)?)?;
     m.add_function(wrap_pyfunction!(extract_psv, m)?)?;
+    m.add_function(wrap_pyfunction!(stats::psv_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(stats::estimate_eval_scale, m)?)?;
     Ok(())
 }

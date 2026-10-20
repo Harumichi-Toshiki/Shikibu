@@ -20,12 +20,12 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use numpy::IntoPyArray;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyList};
 
 use crate::position;
 use crate::psv::{self, REC};
@@ -34,6 +34,8 @@ use crate::rng::Rng;
 
 /// コピーしたファイルの名前の接頭辞。cache_dir の中で、この接頭辞のファイルだけを消す。
 const CACHE_PREFIX: &str = "shk_cache_";
+/// 1局面の特徴数の目安（作業領域と出力の確保に使う）
+const FEATS_PER_POS: usize = 128;
 /// 条件変数を待つ間隔（停止の合図を取りこぼさないため）。
 const POLL: Duration = Duration::from_millis(50);
 
@@ -71,24 +73,27 @@ struct Done {
 }
 
 /// 1バッチぶんの出力（nn.EmbeddingBag の形式、§S3.3）。
-struct Features {
-    stm_idx: Vec<i64>,
+pub(crate) struct Features {
+    pub(crate) stm_idx: Vec<i64>,
     stm_off: Vec<i64>,
-    nstm_idx: Vec<i64>,
+    pub(crate) nstm_idx: Vec<i64>,
     nstm_off: Vec<i64>,
     score: Vec<f32>,
     result: Vec<f32>,
 }
 
-fn features_of(raw: &[u8], version: u8) -> Result<Features, String> {
+pub(crate) fn features_of(raw: &[u8], version: u8) -> Result<Features, String> {
+    let n = raw.len() / REC;
+    // 1局面あたり両視点で約 130 個（盤上の駒と持ち駒、隣接する駒の対）
     let mut f = Features {
-        stm_idx: Vec::new(),
-        stm_off: Vec::new(),
-        nstm_idx: Vec::new(),
-        nstm_off: Vec::new(),
-        score: Vec::new(),
-        result: Vec::new(),
+        stm_idx: Vec::with_capacity(n * FEATS_PER_POS),
+        stm_off: Vec::with_capacity(n),
+        nstm_idx: Vec::with_capacity(n * FEATS_PER_POS),
+        nstm_off: Vec::with_capacity(n),
+        score: Vec::with_capacity(n),
+        result: Vec::with_capacity(n),
     };
+    let mut buf: Vec<u32> = Vec::with_capacity(FEATS_PER_POS);
     for rec in raw.chunks_exact(REC) {
         let (pos, score, _, _, result) = position::decode_psv(rec)?;
         if !(-1..=1).contains(&result) {
@@ -96,12 +101,13 @@ fn features_of(raw: &[u8], version: u8) -> Result<Features, String> {
         }
         let stm = pos.stm;
         let nstm = 1 - stm;
+        let pieces = raypair::Pieces::new(&pos);
         f.stm_off.push(f.stm_idx.len() as i64);
-        f.stm_idx
-            .extend(raypair::features(&pos, stm, version)?.into_iter().map(|i| i as i64));
+        raypair::features_from(&pieces, stm, version, &mut buf)?;
+        f.stm_idx.extend(buf.iter().map(|&i| i as i64));
         f.nstm_off.push(f.nstm_idx.len() as i64);
-        f.nstm_idx
-            .extend(raypair::features(&pos, nstm, version)?.into_iter().map(|i| i as i64));
+        raypair::features_from(&pieces, nstm, version, &mut buf)?;
+        f.nstm_idx.extend(buf.iter().map(|&i| i as i64));
         f.score.push(score as f32);
         f.result.push((result as f32 + 1.0) * 0.5);
     }
@@ -119,12 +125,21 @@ struct CacheState {
     stop: bool,
 }
 
+/// 1ファイルのコピーの記録（`cache_stats` で返す）。
+struct CopyStat {
+    file: String,
+    bytes: u64,
+    seconds: f64,
+}
+
 struct CacheHub {
     dir: PathBuf,
     /// 同時にあってよいファイル数（max_cached + 1）
     cap: usize,
     state: Mutex<CacheState>,
     cv: Condvar,
+    /// コピーしたファイルごとの記録（コピーが済んだ順）
+    stats: Mutex<Vec<CopyStat>>,
 }
 
 impl CacheHub {
@@ -139,6 +154,7 @@ impl CacheHub {
                 stop: false,
             }),
             cv: Condvar::new(),
+            stats: Mutex::new(Vec::new()),
         }
     }
 
@@ -179,10 +195,19 @@ fn copy_ahead(paths: Arc<Vec<PathBuf>>, first: usize, hub: Arc<CacheHub>) {
         let dst = hub.dir.join(&name);
         // 途中のファイルは .part の名前で作り、揃ってから本名にする
         let part = hub.dir.join(format!("{name}.part"));
-        let res = fs::copy(&paths[idx], &part).and_then(|_| fs::rename(&part, &dst));
+        let started = Instant::now();
+        let res = fs::copy(&paths[idx], &part).and_then(|n| fs::rename(&part, &dst).map(|_| n));
+        let seconds = started.elapsed().as_secs_f64();
         let mut st = lock(&hub.state);
         match res {
-            Ok(()) => st.ready.push_back(idx),
+            Ok(bytes) => {
+                let file = paths[idx]
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                lock(&hub.stats).push(CopyStat { file, bytes, seconds });
+                st.ready.push_back(idx)
+            }
             Err(e) => st.error = Some(format!("{}: コピー失敗: {e}", paths[idx].display())),
         }
         hub.cv.notify_all();
@@ -578,6 +603,23 @@ impl BatchLoader {
 
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
+    }
+
+    /// `cache_dir` へのコピーの記録。ファイルごとに `{"file", "bytes", "seconds", "mb_per_s"}` の dict を
+    /// コピーが済んだ順に返す（MB は 10⁶ バイト）。`cache_dir` を指定していなければ空のリスト。
+    fn cache_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let list = PyList::empty(py);
+        if let Some(hub) = &self.cache {
+            for s in lock(&hub.stats).iter() {
+                let d = PyDict::new(py);
+                d.set_item("file", &s.file)?;
+                d.set_item("bytes", s.bytes)?;
+                d.set_item("seconds", s.seconds)?;
+                d.set_item("mb_per_s", s.bytes as f64 / 1e6 / s.seconds.max(1e-9))?;
+                list.append(d)?;
+            }
+        }
+        Ok(list)
     }
 
     fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {

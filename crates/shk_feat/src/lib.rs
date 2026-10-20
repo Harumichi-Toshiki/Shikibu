@@ -4,7 +4,9 @@
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
+mod bench;
 mod position;
 mod psv;
 mod raypair;
@@ -66,6 +68,32 @@ fn extract_psv(rec: &[u8], perspective: i64, version: i64) -> PyResult<Vec<u32>>
     raypair::features(&pos, persp, version).map_err(to_py_err)
 }
 
+/// 計測用：PSV の先頭 `n` 局面（足りなければ循環）について、解読と両視点の特徴抽出を行い、
+/// `{"positions": n, "seconds": 秒}` を返す。Python を介さない純粋な計算の速さを測る。
+#[pyfunction]
+fn bench_extract<'py>(
+    py: Python<'py>,
+    paths: Vec<String>,
+    n: usize,
+    version: i64,
+    num_threads: usize,
+) -> PyResult<Bound<'py, PyDict>> {
+    let version = check_version(version)?;
+    if n == 0 {
+        return Err(PyValueError::new_err("n は1以上"));
+    }
+    if num_threads == 0 {
+        return Err(PyValueError::new_err("num_threads は1以上"));
+    }
+    let seconds = py
+        .allow_threads(|| bench::bench_extract(&paths, n, version, num_threads))
+        .map_err(to_py_err)?;
+    let d = PyDict::new(py);
+    d.set_item("positions", n)?;
+    d.set_item("seconds", seconds)?;
+    Ok(d)
+}
+
 /// 全局面をシャッフルしてシャードに分割する（§S3.1）。出力はシャードのパス（昇順）。
 #[pyfunction]
 fn shuffle_shards(
@@ -88,6 +116,7 @@ fn shikibu_feat(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(extract_sfen, m)?)?;
     m.add_function(wrap_pyfunction!(decode_psv, m)?)?;
     m.add_function(wrap_pyfunction!(extract_psv, m)?)?;
+    m.add_function(wrap_pyfunction!(bench_extract, m)?)?;
     m.add_function(wrap_pyfunction!(stats::psv_stats, m)?)?;
     m.add_function(wrap_pyfunction!(stats::estimate_eval_scale, m)?)?;
     m.add_function(wrap_pyfunction!(shuffle_shards, m)?)?;

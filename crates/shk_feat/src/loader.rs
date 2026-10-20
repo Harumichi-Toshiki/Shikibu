@@ -71,16 +71,16 @@ struct Done {
 }
 
 /// 1バッチぶんの出力（nn.EmbeddingBag の形式、§S3.3）。
-struct Features {
-    stm_idx: Vec<i64>,
+pub(crate) struct Features {
+    pub(crate) stm_idx: Vec<i64>,
     stm_off: Vec<i64>,
-    nstm_idx: Vec<i64>,
+    pub(crate) nstm_idx: Vec<i64>,
     nstm_off: Vec<i64>,
     score: Vec<f32>,
     result: Vec<f32>,
 }
 
-fn features_of(raw: &[u8], version: u8) -> Result<Features, String> {
+pub(crate) fn features_of(raw: &[u8], version: u8) -> Result<Features, String> {
     let mut f = Features {
         stm_idx: Vec::new(),
         stm_off: Vec::new(),

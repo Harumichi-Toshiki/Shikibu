@@ -1,0 +1,13 @@
+[package]
+name = "shk_feat"
+version = "0.1.0"
+edition = "2021"
+description = "Shikibu M1: RayPair 特徴抽出と PackedSfen デコーダ"
+publish = false
+
+[lib]
+name = "shikibu_feat"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.24", features = ["extension-module"] }

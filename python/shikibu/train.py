@@ -426,10 +426,15 @@ def parse_args(argv):
 
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
-    cfg = load_config(args.config)
-    validate(cfg)
-    os.makedirs(cfg["output"]["out_dir"], exist_ok=True)
-    Trainer(cfg, args.resume).run()
+    try:
+        cfg = load_config(args.config)
+        validate(cfg)
+        os.makedirs(cfg["output"]["out_dir"], exist_ok=True)
+        Trainer(cfg, args.resume).run()
+    except (ValueError, RuntimeError, FileExistsError) as e:
+        # 設定やデータの問題は、学習を始める前に分かるものだけ。エラーの内容を表示して 1 で終わる。
+        print(f"エラー: {e}", file=sys.stderr)
+        return 1
     return 0
 
 

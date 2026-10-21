@@ -1,15 +1,17 @@
 # Colab（L4）で RayPair_v0Network を学習する設定。データは Drive、キャッシュはローカル SSD。
 # 出力先（Drive）：/content/drive/MyDrive/shikibu/runs/colab_v0/
-# max_steps は1セッションで終わる量（この値は初期値。ノートブックで上書きできる）。total_steps は40億局面1周ぶん（16384 × 244,000 ≈ 40億）。
-# 学習率などは初期値。実測のあとで調整する。
+# 学習データ：PonkotsuWCSC35_unique_*.psv（約19.6億局面、1局面40バイト）。
+# total_steps・max_steps は 179,000（バッチ 65,536 × 179,000 ≈ 117億局面 ≈ 6周）。
+# max_steps は1セッションで終わる量（この値は初期値。ノートブックで上書きできる）。学習率などは初期値。実測のあとで調整する。
 
 [data]
-# 学習用シャード。検証用の1つ（最後のシャード）は shard_val.psv という名前にして学習から外す。
-train_glob = "/content/drive/MyDrive/shikibu/shards/shard_[0-9]*.psv"
-val_path = "/content/drive/MyDrive/shikibu/shards/shard_val.psv"
+# 学習用の PSV。周回ごとに、ファイルの順番を seed + 周回番号 で並べ替えて読む。
+train_glob = "/content/drive/MyDrive/DainagonProject/匠生用/データセット/psv/PonkotsuWCSC35_unique_*.psv"
+# 検証用の PSV は今の配置には無いので空（検証は行わない）。用意できたらここに指定する。
+val_path = ""
 cache_dir = "/content/shk_cache"
 max_cached = 3
-shuffle_buffer = 0
+shuffle_buffer = 20000000
 num_threads = 11
 
 [model]
@@ -17,12 +19,12 @@ network = "RayPair_v0Network"
 ft_width = 128
 
 [train]
-batch_size = 16384
+batch_size = 65536
 lr = 1e-3
 weight_decay = 1e-4
 warmup_steps = 1000
-total_steps = 244000
-max_steps = 30000
+total_steps = 179000
+max_steps = 179000
 min_lr_ratio = 0.01
 lam = 0.75
 eval_scale = "auto"
@@ -34,8 +36,9 @@ torch_threads = 1
 deterministic = false
 save_every_steps = 0
 save_every_minutes = 30.0
-val_every_steps = 2000
+val_every_steps = 0
 val_positions = 100000
+progress_every_sec = 30.0
 log_every_steps = 100
 
 [output]

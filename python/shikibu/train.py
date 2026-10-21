@@ -3,7 +3,8 @@
 使い方：python -m shikibu.train --config <TOML> [--resume]
 
 - 重みの初期化より前に乱数の種を決める。乱数の状態・ローダーの位置・オプティマイザは checkpoint.pt に保存する。
-- 局面は shikibu_feat.BatchLoader から読む。1周したら、次の周は seed + 周回番号 の新しいローダーで続ける。
+- 局面は shikibu_feat.BatchLoader から読む。各周回の始めに、学習ファイルの順番を seed + 周回番号 で並べ替えてから渡す。
+  順番は checkpoint.pt の file_perm に保存する（無ければ M3 と同じ並び順）。
 - ログは <out_dir>/log.jsonl（1行1 JSON）。
 """
 import argparse
@@ -13,6 +14,7 @@ import math
 import os
 import random
 import sys
+import tempfile
 import time
 import tomllib
 
@@ -27,6 +29,8 @@ from shikibu import networks
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 LIMIT = 127.0 / 64.0  # §F3.3 の Linear の重みの範囲
+PSV_BYTES = 40
+SCALE_BLOCK = 10_000  # eval_scale の推定に使う局面を取り出す連続ブロックの長さ（局面数）
 DECAY_PARAMS = ("l1.weight", "l2.weight", "out.weight")  # weight decay の対象（§S6）
 BATCH_KEYS = ("stm_indices", "stm_offsets", "nstm_indices", "nstm_offsets", "score", "result")
 
@@ -62,6 +66,7 @@ DEFAULTS = {
         "val_every_steps": 0,
         "val_positions": 100_000,
         "log_every_steps": 100,
+        "progress_every_sec": 30.0,
     },
     "output": {"out_dir": ""},
 }
@@ -112,6 +117,13 @@ def eval_scale_setting(v):
     raise ValueError(f'eval_scale は "auto" か正の数: {v!r}')
 
 
+def epoch_perm(n, seed, epoch):
+    """周回ごとのファイルの並べ方（0〜n−1 の順列）。seed + 周回番号 で決まる。"""
+    perm = list(range(n))
+    random.Random(seed + epoch).shuffle(perm)
+    return perm
+
+
 def train_paths(d):
     if d["train_glob"]:
         paths = sorted(glob.glob(d["train_glob"]))
@@ -123,6 +135,36 @@ def train_paths(d):
 
 
 # ---------- 部品 ----------
+
+def sample_scale_positions(paths, limit, seed, out_path):
+    """勝敗の確認と eval_scale の推定に使う局面を取り出す（§S4）。
+
+    全ファイルから、ファイルの大きさに比例した数の「ランダムな位置の連続ブロック」を取る。
+    局面数が limit 以下なら全部使う（ファイルをそのまま渡す）。
+    返り値：(使うファイルのリスト, 局面数)。抜き出したときは out_path に書く。
+    """
+    sizes = [os.path.getsize(p) // PSV_BYTES for p in paths]
+    total = sum(sizes)
+    if total <= limit:
+        return list(paths), total
+    rng = np.random.default_rng(seed)
+    count = 0
+    with open(out_path, "wb") as out:
+        for p, n in zip(paths, sizes):
+            quota = limit * n // total
+            if quota == 0:
+                continue
+            nb = -(-quota // SCALE_BLOCK)  # ブロック数（切り上げ）
+            lens = [quota // nb] * nb
+            lens[-1] += quota - sum(lens)
+            with open(p, "rb") as f:
+                for ln in lens:
+                    start = int(rng.integers(0, n - ln + 1))
+                    f.seek(start * PSV_BYTES)
+                    out.write(f.read(ln * PSV_BYTES))
+                    count += ln
+    return [out_path], count
+
 
 def pick_device(name):
     if name == "auto":
@@ -219,6 +261,45 @@ def evaluate(model, val, eval_scale, lam):
     return float(loss.item()), float(mse.item())
 
 
+def fmt_sec(s):
+    """残り秒数を「1時間02分」「2分05秒」の形にする。不明なら「--」。"""
+    if s is None:
+        return "--"
+    h, rem = divmod(int(s), 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h}時間{m:02d}分" if h else f"{m}分{sec:02d}秒"
+
+
+class Status:
+    """out_dir/status.json に、今の段階と進み具合を書く（一時ファイル→改名）。監視ツールが読む。"""
+
+    def __init__(self, out_dir):
+        self.path = os.path.join(out_dir, "status.json")
+        self.phase = None
+        self.history = []
+        self.step, self.max_steps, self.eta_sec = 0, 0, None
+
+    def enter(self, name, log=None):
+        self.phase = name
+        self.history.append(name)
+        if log is not None:
+            log.write({"type": "phase", "name": name})
+        self.write()
+
+    def progress(self, step, max_steps, eta_sec):
+        self.step, self.max_steps, self.eta_sec = step, max_steps, eta_sec
+        self.write()
+
+    def write(self):
+        data = {"phase": self.phase, "history": self.history, "step": self.step, "max_steps": self.max_steps,
+                "progress": self.step / self.max_steps if self.max_steps else 0.0,
+                "eta_sec": self.eta_sec, "updated": time.time()}
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, self.path)
+
+
 class JsonlLog:
     def __init__(self, path):
         self.f = open(path, "a", encoding="utf-8")
@@ -234,8 +315,9 @@ class JsonlLog:
 # ---------- 学習 ----------
 
 class Trainer:
-    def __init__(self, cfg, resume):
+    def __init__(self, cfg, resume, status=None):
         self.cfg = cfg
+        self.status = status or Status(cfg["output"]["out_dir"])
         d, m, t, o = cfg["data"], cfg["model"], cfg["train"], cfg["output"]
         self.d, self.t = d, t
         self.out_dir = o["out_dir"]
@@ -243,6 +325,7 @@ class Trainer:
         self.lam = float(t["lam"])
         self.paths = train_paths(d)
         self.saved_step = -1
+        self.scale_used = None  # 勝敗の確認と推定に使った局面数（新規の学習でだけ決まる）
 
         ck = None
         if os.path.exists(self.ckpt_path):
@@ -267,39 +350,59 @@ class Trainer:
         if ck is None:
             self.eval_scale, self.eval_scale_source = self._decide_eval_scale()
             self.step, self.epoch, loader_state = 0, 0, None
+            self.perm = epoch_perm(len(self.paths), t["seed"], 0)
         else:
             self.model.load_state_dict(ck["model"])
             self.optimizer.load_state_dict(ck["optimizer"])
             self.eval_scale, self.eval_scale_source = ck["eval_scale"], ck["eval_scale_source"]
             self.step, self.epoch, loader_state = ck["step"], ck["epoch"], ck["loader_state"]
+            # M3 の checkpoint には file_perm が無い。その場合は M3 と同じ並び（設定の順）で続ける
+            self.perm = ck.get("file_perm", list(range(len(self.paths))))
+            if sorted(self.perm) != list(range(len(self.paths))):
+                raise ValueError("checkpoint の file_perm が学習データのファイル数と合わない")
             restore_rng(ck["rng"])
 
         self.val = self._load_validation()
-        self.loader = None
-        self.cache_seen = 0
-        self._open_loader(loader_state)
         self.log = JsonlLog(os.path.join(self.out_dir, "log.jsonl"))
         self.t0 = time.monotonic()
         self.last_save = self.t0
         self.last_log = self.t0
         self.pos_since_log = 0
+        self.pos_since_print = 0
+        self._write_start()
+        self.loader = None
+        self.cache_seen = 0
+        if d["cache_dir"]:
+            self.status.enter("prefetch", self.log)
+        self._open_loader(loader_state)
 
     def _decide_eval_scale(self):
-        """勝敗の欠損を確かめ、eval_scale を決める。判定は先頭の1ファイルだけで行う（§S4）。"""
+        """勝敗の欠損を確かめ、eval_scale を決める（§S4）。判定は全ファイルから抜いた局面（scale_sample 以下）で行う。"""
         t, lam = self.t, self.lam
         setting = eval_scale_setting(t["eval_scale"])
-        stats = shikibu_feat.psv_stats([self.paths[0]])
-        if stats["result_missing"]:
-            if not t["allow_missing_results"]:
-                raise RuntimeError("勝敗が欠損している（psv_stats）。データを確認するか allow_missing_results = true にする")
-            if lam != 1.0:
-                raise RuntimeError("勝敗が欠損のときは lam = 1.0 が必要")
-            if setting is None:
-                raise RuntimeError("勝敗が欠損のときは eval_scale を数値で指定する")
-        if setting is not None:
-            return setting, "config"
-        est = shikibu_feat.estimate_eval_scale([self.paths[0]], sample=t["scale_sample"], seed=t["seed"])
-        return float(est["eval_scale"]), "auto"
+        self.status.enter("data_check")
+        sample_path = os.path.join(tempfile.gettempdir(), "shikibu_scale_sample.psv")  # ローカルに書く（Drive には書かない）
+        files, count = sample_scale_positions(self.paths, t["scale_sample"], t["seed"], sample_path)
+        self.scale_used = count
+        try:
+            if count == 0:
+                raise RuntimeError("学習データに局面が1つも無い")
+            stats = shikibu_feat.psv_stats(files)
+            if stats["result_missing"]:
+                if not t["allow_missing_results"]:
+                    raise RuntimeError("勝敗が欠損している（psv_stats）。データを確認するか allow_missing_results = true にする")
+                if lam != 1.0:
+                    raise RuntimeError("勝敗が欠損のときは lam = 1.0 が必要")
+                if setting is None:
+                    raise RuntimeError("勝敗が欠損のときは eval_scale を数値で指定する")
+            if setting is not None:
+                return setting, "config"
+            self.status.enter("eval_scale")
+            est = shikibu_feat.estimate_eval_scale(files, sample=count, seed=t["seed"])
+            return float(est["eval_scale"]), "auto"
+        finally:
+            if files != list(self.paths) and os.path.exists(sample_path):
+                os.remove(sample_path)
 
     def _load_validation(self):
         if not self.d["val_path"]:
@@ -316,8 +419,9 @@ class Trainer:
         d, t = self.d, self.t
         self.loader = None  # 前のローダーを止めてからでないと、キャッシュ先を作り直せない
         self.cache_seen = 0
+        paths = [self.paths[i] for i in self.perm]  # 周回ごとの順番
         self.loader = shikibu_feat.BatchLoader(
-            self.paths, t["batch_size"], self.version,
+            paths, t["batch_size"], self.version,
             shuffle_buffer=d["shuffle_buffer"], seed=t["seed"] + self.epoch,
             num_threads=d["num_threads"], cache_dir=d["cache_dir"] or None,
             max_cached=d["max_cached"], resume_state=state,
@@ -325,8 +429,9 @@ class Trainer:
 
     def _next_batch(self):
         batch = next(self.loader, None)
-        if batch is None:  # 1周終わった。次の周は seed + 周回番号
+        if batch is None:  # 1周終わった。次の周は seed + 周回番号 の順番で
             self.epoch += 1
+            self.perm = epoch_perm(len(self.paths), self.t["seed"], self.epoch)
             self._open_loader(None)
             batch = next(self.loader, None)
             if batch is None:
@@ -355,6 +460,7 @@ class Trainer:
             "network": self.cfg["model"]["network"],
             "config": self.cfg,
             "rng": rng_state(),
+            "file_perm": self.perm,
         }
         tmp = self.ckpt_path + ".tmp"
         torch.save(state, tmp)
@@ -378,31 +484,71 @@ class Trainer:
         clip_weights_(self.model)
         self.step += 1
         self.pos_since_log += int(x["score"].shape[0])
+        self.pos_since_print += int(x["score"].shape[0])
         return loss, lr
 
-    def run(self):
-        t = self.t
+    def _write_start(self):
         self.log.write({
             "type": "start", "step": self.step, "epoch": self.epoch, "resumed": self.step > 0,
             "eval_scale": self.eval_scale, "eval_scale_source": self.eval_scale_source,
             "lam": self.lam, "network": self.cfg["model"]["network"], "device": str(self.device),
-            "n_files": len(self.paths), "config": self.cfg,
+            "n_files": len(self.paths), "scale_positions_used": self.scale_used, "config": self.cfg,
         })
+
+    def _eta(self, now):
+        """残り秒数の見込み。この実行の train 段階の平均速度から求める（0 以上）。"""
+        done = self.step - self.step_train0
+        if done <= 0:
+            return None
+        return max(0.0, (self.t["max_steps"] - self.step) * (now - self.t_train0) / done)
+
+    def _progress_due(self, now):
+        pe = self.t["progress_every_sec"]
+        if pe > 0:
+            return now - self.last_print >= pe
+        return self.step % self.t["log_every_steps"] == 0
+
+    def _report(self, now):
+        """画面に進捗を1行出し、status.json を書く。"""
+        t = self.t
+        eta = self._eta(now)
+        pps = self.pos_since_print / max(now - self.last_print, 1e-9)
+        pct = 100.0 * self.step / t["max_steps"]
+        print(f"[{pct:5.1f}%] step {self.step:,} / {t['max_steps']:,}  残り {fmt_sec(eta)}  {pps / 1e4:.1f}万局面/秒",
+              flush=True)
+        self.status.progress(self.step, t["max_steps"], eta)
+        self.last_print, self.pos_since_print, self.printed_step = now, 0, self.step
+
+    def run(self):
+        t = self.t
         save_interval = t["save_every_minutes"] * 60.0
+        self.pending = None
+        if self.d["shuffle_buffer"] > 0:
+            self.status.enter("buffer_fill", self.log)
+            self.pending = self._next_batch()  # 最初の1回でシャッフルバッファを満たす
+        self.status.enter("train", self.log)
+        self.t_train0, self.step_train0 = time.monotonic(), self.step
+        self.last_print, self.printed_step = self.t_train0, None
         while self.step < t["max_steps"]:
-            batch = self._next_batch()
+            if self.pending is not None:
+                batch, self.pending = self.pending, None
+            else:
+                batch = self._next_batch()
             loss, lr = self._train_step(batch)
 
+            now = time.monotonic()
             if self.step % t["log_every_steps"] == 0:
-                now = time.monotonic()
                 self.log.write({
                     "type": "train", "step": self.step, "epoch": self.epoch,
                     "loss": float(loss.item()), "lr": lr,
+                    "progress": self.step / t["max_steps"], "eta_sec": self._eta(now),
                     "positions_per_sec": self.pos_since_log / max(now - self.last_log, 1e-9),
                     "elapsed_sec": now - self.t0,
                 })
                 self.last_log = now
                 self.pos_since_log = 0
+            if self._progress_due(now):
+                self._report(now)
 
             if self.val is not None and t["val_every_steps"] > 0 and self.step % t["val_every_steps"] == 0:
                 val_loss, val_mse = evaluate(self.model, self.val, self.eval_scale, self.lam)
@@ -412,12 +558,16 @@ class Trainer:
             if periodic or time.monotonic() - self.last_save >= save_interval:
                 self.save("periodic")
 
+        if self.printed_step != self.step:
+            self._report(time.monotonic())
         if self.saved_step != self.step:
             self.save("final")
         self.log.write({"type": "end", "step": self.step, "epoch": self.epoch,
                         "elapsed_sec": time.monotonic() - self.t0})
         self.log.close()
         self.loader = None
+        self.status.progress(self.step, t["max_steps"], 0.0)
+        self.status.enter("done")
 
 
 def parse_args(argv):
@@ -429,13 +579,17 @@ def parse_args(argv):
 
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    status = None
     try:
         cfg = load_config(args.config)
         validate(cfg)
         os.makedirs(cfg["output"]["out_dir"], exist_ok=True)
-        Trainer(cfg, args.resume).run()
+        status = Status(cfg["output"]["out_dir"])
+        Trainer(cfg, args.resume, status).run()
     except (ValueError, RuntimeError, FileExistsError) as e:
         # 設定やデータの問題は、学習を始める前に分かるものだけ。エラーの内容を表示して 1 で終わる。
+        if status is not None and status.history:  # 段階に入っていたら status.json を error にする
+            status.enter("error")
         print(f"エラー: {e}", file=sys.stderr)
         return 1
     return 0

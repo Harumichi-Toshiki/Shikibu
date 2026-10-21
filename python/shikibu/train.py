@@ -3,7 +3,8 @@
 使い方：python -m shikibu.train --config <TOML> [--resume]
 
 - 重みの初期化より前に乱数の種を決める。乱数の状態・ローダーの位置・オプティマイザは checkpoint.pt に保存する。
-- 局面は shikibu_feat.BatchLoader から読む。1周したら、次の周は seed + 周回番号 の新しいローダーで続ける。
+- 局面は shikibu_feat.BatchLoader から読む。各周回の始めに、学習ファイルの順番を seed + 周回番号 で並べ替えてから渡す。
+  順番は checkpoint.pt の file_perm に保存する（無ければ M3 と同じ並び順）。
 - ログは <out_dir>/log.jsonl（1行1 JSON）。
 """
 import argparse
@@ -113,6 +114,13 @@ def eval_scale_setting(v):
     if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
         return float(v)
     raise ValueError(f'eval_scale は "auto" か正の数: {v!r}')
+
+
+def epoch_perm(n, seed, epoch):
+    """周回ごとのファイルの並べ方（0〜n−1 の順列）。seed + 周回番号 で決まる。"""
+    perm = list(range(n))
+    random.Random(seed + epoch).shuffle(perm)
+    return perm
 
 
 def train_paths(d):
@@ -341,11 +349,16 @@ class Trainer:
         if ck is None:
             self.eval_scale, self.eval_scale_source = self._decide_eval_scale()
             self.step, self.epoch, loader_state = 0, 0, None
+            self.perm = epoch_perm(len(self.paths), t["seed"], 0)
         else:
             self.model.load_state_dict(ck["model"])
             self.optimizer.load_state_dict(ck["optimizer"])
             self.eval_scale, self.eval_scale_source = ck["eval_scale"], ck["eval_scale_source"]
             self.step, self.epoch, loader_state = ck["step"], ck["epoch"], ck["loader_state"]
+            # M3 の checkpoint には file_perm が無い。その場合は M3 と同じ並び（設定の順）で続ける
+            self.perm = ck.get("file_perm", list(range(len(self.paths))))
+            if sorted(self.perm) != list(range(len(self.paths))):
+                raise ValueError("checkpoint の file_perm が学習データのファイル数と合わない")
             restore_rng(ck["rng"])
 
         self.val = self._load_validation()
@@ -405,8 +418,9 @@ class Trainer:
         d, t = self.d, self.t
         self.loader = None  # 前のローダーを止めてからでないと、キャッシュ先を作り直せない
         self.cache_seen = 0
+        paths = [self.paths[i] for i in self.perm]  # 周回ごとの順番
         self.loader = shikibu_feat.BatchLoader(
-            self.paths, t["batch_size"], self.version,
+            paths, t["batch_size"], self.version,
             shuffle_buffer=d["shuffle_buffer"], seed=t["seed"] + self.epoch,
             num_threads=d["num_threads"], cache_dir=d["cache_dir"] or None,
             max_cached=d["max_cached"], resume_state=state,
@@ -414,8 +428,9 @@ class Trainer:
 
     def _next_batch(self):
         batch = next(self.loader, None)
-        if batch is None:  # 1周終わった。次の周は seed + 周回番号
+        if batch is None:  # 1周終わった。次の周は seed + 周回番号 の順番で
             self.epoch += 1
+            self.perm = epoch_perm(len(self.paths), self.t["seed"], self.epoch)
             self._open_loader(None)
             batch = next(self.loader, None)
             if batch is None:
@@ -444,6 +459,7 @@ class Trainer:
             "network": self.cfg["model"]["network"],
             "config": self.cfg,
             "rng": rng_state(),
+            "file_perm": self.perm,
         }
         tmp = self.ckpt_path + ".tmp"
         torch.save(state, tmp)

@@ -14,6 +14,7 @@ import math
 import os
 import random
 import sys
+import tempfile
 import time
 import tomllib
 
@@ -380,7 +381,7 @@ class Trainer:
         t, lam = self.t, self.lam
         setting = eval_scale_setting(t["eval_scale"])
         self.status.enter("data_check")
-        sample_path = os.path.join(self.out_dir, "scale_sample.psv")
+        sample_path = os.path.join(tempfile.gettempdir(), "shikibu_scale_sample.psv")  # ローカルに書く（Drive には書かない）
         files, count = sample_scale_positions(self.paths, t["scale_sample"], t["seed"], sample_path)
         self.scale_used = count
         try:

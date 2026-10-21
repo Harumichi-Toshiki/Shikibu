@@ -27,6 +27,8 @@ from shikibu import networks
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 LIMIT = 127.0 / 64.0  # §F3.3 の Linear の重みの範囲
+PSV_BYTES = 40
+SCALE_BLOCK = 10_000  # eval_scale の推定に使う局面を取り出す連続ブロックの長さ（局面数）
 DECAY_PARAMS = ("l1.weight", "l2.weight", "out.weight")  # weight decay の対象（§S6）
 BATCH_KEYS = ("stm_indices", "stm_offsets", "nstm_indices", "nstm_offsets", "score", "result")
 
@@ -123,6 +125,36 @@ def train_paths(d):
 
 
 # ---------- 部品 ----------
+
+def sample_scale_positions(paths, limit, seed, out_path):
+    """勝敗の確認と eval_scale の推定に使う局面を取り出す（§S4）。
+
+    全ファイルから、ファイルの大きさに比例した数の「ランダムな位置の連続ブロック」を取る。
+    局面数が limit 以下なら全部使う（ファイルをそのまま渡す）。
+    返り値：(使うファイルのリスト, 局面数)。抜き出したときは out_path に書く。
+    """
+    sizes = [os.path.getsize(p) // PSV_BYTES for p in paths]
+    total = sum(sizes)
+    if total <= limit:
+        return list(paths), total
+    rng = np.random.default_rng(seed)
+    count = 0
+    with open(out_path, "wb") as out:
+        for p, n in zip(paths, sizes):
+            quota = limit * n // total
+            if quota == 0:
+                continue
+            nb = -(-quota // SCALE_BLOCK)  # ブロック数（切り上げ）
+            lens = [quota // nb] * nb
+            lens[-1] += quota - sum(lens)
+            with open(p, "rb") as f:
+                for ln in lens:
+                    start = int(rng.integers(0, n - ln + 1))
+                    f.seek(start * PSV_BYTES)
+                    out.write(f.read(ln * PSV_BYTES))
+                    count += ln
+    return [out_path], count
+
 
 def pick_device(name):
     if name == "auto":
@@ -243,6 +275,7 @@ class Trainer:
         self.lam = float(t["lam"])
         self.paths = train_paths(d)
         self.saved_step = -1
+        self.scale_used = None  # 勝敗の確認と推定に使った局面数（新規の学習でだけ決まる）
 
         ck = None
         if os.path.exists(self.ckpt_path):
@@ -285,21 +318,30 @@ class Trainer:
         self.pos_since_log = 0
 
     def _decide_eval_scale(self):
-        """勝敗の欠損を確かめ、eval_scale を決める。判定は先頭の1ファイルだけで行う（§S4）。"""
+        """勝敗の欠損を確かめ、eval_scale を決める（§S4）。判定は全ファイルから抜いた局面（scale_sample 以下）で行う。"""
         t, lam = self.t, self.lam
         setting = eval_scale_setting(t["eval_scale"])
-        stats = shikibu_feat.psv_stats([self.paths[0]])
-        if stats["result_missing"]:
-            if not t["allow_missing_results"]:
-                raise RuntimeError("勝敗が欠損している（psv_stats）。データを確認するか allow_missing_results = true にする")
-            if lam != 1.0:
-                raise RuntimeError("勝敗が欠損のときは lam = 1.0 が必要")
-            if setting is None:
-                raise RuntimeError("勝敗が欠損のときは eval_scale を数値で指定する")
-        if setting is not None:
-            return setting, "config"
-        est = shikibu_feat.estimate_eval_scale([self.paths[0]], sample=t["scale_sample"], seed=t["seed"])
-        return float(est["eval_scale"]), "auto"
+        sample_path = os.path.join(self.out_dir, "scale_sample.psv")
+        files, count = sample_scale_positions(self.paths, t["scale_sample"], t["seed"], sample_path)
+        self.scale_used = count
+        try:
+            if count == 0:
+                raise RuntimeError("学習データに局面が1つも無い")
+            stats = shikibu_feat.psv_stats(files)
+            if stats["result_missing"]:
+                if not t["allow_missing_results"]:
+                    raise RuntimeError("勝敗が欠損している（psv_stats）。データを確認するか allow_missing_results = true にする")
+                if lam != 1.0:
+                    raise RuntimeError("勝敗が欠損のときは lam = 1.0 が必要")
+                if setting is None:
+                    raise RuntimeError("勝敗が欠損のときは eval_scale を数値で指定する")
+            if setting is not None:
+                return setting, "config"
+            est = shikibu_feat.estimate_eval_scale(files, sample=count, seed=t["seed"])
+            return float(est["eval_scale"]), "auto"
+        finally:
+            if files != list(self.paths) and os.path.exists(sample_path):
+                os.remove(sample_path)
 
     def _load_validation(self):
         if not self.d["val_path"]:
@@ -386,7 +428,7 @@ class Trainer:
             "type": "start", "step": self.step, "epoch": self.epoch, "resumed": self.step > 0,
             "eval_scale": self.eval_scale, "eval_scale_source": self.eval_scale_source,
             "lam": self.lam, "network": self.cfg["model"]["network"], "device": str(self.device),
-            "n_files": len(self.paths), "config": self.cfg,
+            "n_files": len(self.paths), "scale_positions_used": self.scale_used, "config": self.cfg,
         })
         save_interval = t["save_every_minutes"] * 60.0
         while self.step < t["max_steps"]:

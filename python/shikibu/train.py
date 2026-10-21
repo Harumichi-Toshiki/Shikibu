@@ -13,6 +13,7 @@ import json
 import math
 import os
 import random
+import signal
 import sys
 import tempfile
 import time
@@ -24,6 +25,7 @@ import torch.nn.functional as F
 
 import shikibu_feat
 from shikibu import networks
+from shikibu.lock import TrainLock
 
 # CUDA で決定的な計算（use_deterministic_algorithms）を使うときに必要。torch の CUDA 初期化より前に設定する。
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
@@ -89,6 +91,29 @@ def load_config(path):
     return cfg
 
 
+PLACEHOLDER_KEYS = [("data", "train_paths"), ("data", "train_glob"), ("data", "val_path"),
+                    ("data", "cache_dir"), ("output", "out_dir")]
+
+
+def check_placeholders(cfg):
+    """パスに "<…>" の目印が残っていたら、ひな形のまま使おうとしているので止める（何も書かない）。"""
+    found = []
+    for sec, key in PLACEHOLDER_KEYS:
+        v = cfg[sec][key]
+        for s in (v if isinstance(v, list) else [v]):
+            if isinstance(s, str) and "<" in s and ">" in s:
+                found.append(f"{sec}.{key} = {s}")
+    if found:
+        raise ValueError("設定のひな形のまま（<…> の目印が残っている）です。自分の環境に合わせて書き換えてから使ってください: "
+                         + "; ".join(found))
+
+
+def _check_min(section, key, minimum):
+    v = section[key]
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v < minimum:
+        raise ValueError(f"train.{key} は {minimum} 以上の数: {v!r}")
+
+
 def validate(cfg):
     d, t = cfg["data"], cfg["train"]
     if not d["train_paths"] and not d["train_glob"]:
@@ -106,6 +131,10 @@ def validate(cfg):
     if d["val_path"] and t["val_positions"] <= 0:
         raise ValueError("val_positions は1以上")
     eval_scale_setting(t["eval_scale"])
+    _check_min(t, "log_every_steps", 1)
+    _check_min(t, "save_every_steps", 0)  # 0 は無効
+    _check_min(t, "val_every_steps", 0)   # 0 は無効
+    _check_min(t, "progress_every_sec", 0.0)
 
 
 def eval_scale_setting(v):
@@ -574,17 +603,26 @@ def parse_args(argv):
     p = argparse.ArgumentParser(prog="python -m shikibu.train")
     p.add_argument("--config", required=True, help="設定ファイル（TOML）")
     p.add_argument("--resume", action="store_true", help="checkpoint.pt から続ける")
+    p.add_argument("--force-unlock", action="store_true",
+                   help="実行中かもしれないロック（train.lock）も引き継ぐ。切断直後などに使う")
     return p.parse_args(argv)
+
+
+def _on_term(signum, frame):
+    raise SystemExit(128 + signum)  # 後始末（ロックの解放）を通すため、例外として抜ける
 
 
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
-    status = None
+    status, lock = None, None
+    signal.signal(signal.SIGTERM, _on_term)
     try:
         cfg = load_config(args.config)
+        check_placeholders(cfg)
         validate(cfg)
-        os.makedirs(cfg["output"]["out_dir"], exist_ok=True)
-        status = Status(cfg["output"]["out_dir"])
+        out_dir = cfg["output"]["out_dir"]
+        lock = TrainLock.acquire(out_dir, force=args.force_unlock)  # 何かを書く前に、二重起動を確かめる
+        status = Status(out_dir)
         Trainer(cfg, args.resume, status).run()
     except (ValueError, RuntimeError, FileExistsError) as e:
         # 設定やデータの問題は、学習を始める前に分かるものだけ。エラーの内容を表示して 1 で終わる。
@@ -592,6 +630,9 @@ def main(argv=None):
             status.enter("error")
         print(f"エラー: {e}", file=sys.stderr)
         return 1
+    finally:
+        if lock is not None:
+            lock.release()
     return 0
 
 

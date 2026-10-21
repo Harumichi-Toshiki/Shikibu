@@ -33,8 +33,12 @@ def _out_dir(cfg):
     return cfg["output"]["out_dir"]
 
 
-def start(config_path, repo=REPO):
-    """学習を裏で開始する。すでに動いていれば何もしない。"""
+def start(config_path, repo=REPO, force=False):
+    """学習を裏で開始する。すでに動いていれば何もしない。
+
+    同じ出力フォルダで学習が実行中なら、学習器がロックで断り、watch に理由が出る。
+    force=True のときは --force-unlock を付けて、実行中かもしれないロックも引き継ぐ（切断直後などに使う）。
+    """
     global _proc, _manual_stop
     if _proc is not None and _proc.poll() is None:
         print("学習はすでに動いています（PID %d）。" % _proc.pid)
@@ -44,6 +48,8 @@ def start(config_path, repo=REPO):
     cmd = [sys.executable, "-u", "-m", "shikibu.train", "--config", config_path]
     if os.path.exists(ck):
         cmd.append("--resume")
+    if force:
+        cmd.append("--force-unlock")
     pp = os.path.join(repo, "python")
     env = dict(os.environ, PYTHONPATH=pp + (os.pathsep + os.environ["PYTHONPATH"] if os.environ.get("PYTHONPATH") else ""))
     f = open(STDOUT, "a", encoding="utf-8")
@@ -168,7 +174,10 @@ def status(config_path, now=None):
                 st["eta"] = sj["eta_sec"]
         except (json.JSONDecodeError, OSError):
             pass
-    if _proc is not None and not alive:
+    if _proc is not None and not alive and _proc.returncode != 0 and "学習が実行中" in tail_stdout(40):
+        # 学習器がロックで断った（同じ出力フォルダで別の学習が動いている）
+        st["phase"] = "起動できない：同じ出力フォルダで学習が実行中（下の表示を確かめる）"
+    elif _proc is not None and not alive:
         if _manual_stop:
             st["phase"] = "停止（手動）"
         elif _proc.returncode == 0:
@@ -242,7 +251,7 @@ def watch(config_path, interval=15):
             print(text)
             if st["trains"] and os.path.exists(fig):
                 display(Image(fig))
-            if st["phase"].startswith("異常終了"):
+            if st["phase"].startswith(("異常終了", "起動できない")):
                 print("\n--- 学習プロセスの最後の出力 ---\n" + tail_stdout())
                 break
             if st["phase"] in ("完了", "エラーで終了") or st["phase"].startswith("停止"):

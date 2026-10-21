@@ -1,6 +1,6 @@
-# Shikibu / Nuenagon 設計書 v1.0
+# Shikibu / Nuenagon 設計書 v1.1
 
-- 作成日：2026-10-20
+- 作成日：2026-10-20（v1.1：2026-10-21）
 - 作者：Harumichi-Toshiki
 - 対象：Shikibu（学習器）と Nuenagon（αβ探索エンジン）を実装する Claude Code
 - 同じ文書を両リポジトリの `docs/DESIGN.md` に置く。**両者の内容は常に完全に一致していなければならない。**
@@ -297,7 +297,7 @@ z     = out_weight · h2 + out_bias                         # スカラー
 
 ## F5. 評価値スケール（eval_scale）
 
-- 教師データ（ponkotsu WCSC36 から蒸留した PSV）の評価値のスケールは不明なため、**学習器がデータから推定する**（推定方法は §S4）。
+- 教師データ（ponkotsu WCSC35 から蒸留した PSV）の評価値のスケールは不明なため、**学習器がデータから推定する**（推定方法は §S4）。
 - 推定値、または手動で指定した値をヘッダの `eval_scale` に書く。学習時の教師勝率は `sigmoid(score / eval_scale)` で作る。
 - エンジンは評価値を `cp = z × eval_scale` で計算する。こうすると Nuenagon の cp が教師（ponkotsu）と同じ尺度になる。
 - エンジンは USI オプション `EvalScale` で上書きできる（0 のときはファイルの値を使う）。
@@ -393,7 +393,7 @@ Shikibu/
 | 39 | u8 | padding |
 
 - PackedSfen のデコーダは Rust で自作する。**正しさの基準は cshogi**（`Board.set_psfen`）とし、テストで照合する（§S8-1）。
-- 総量は約40億局面（約160GB）。
+- 総量は約20億局面（約82GB）。内訳は Ponkotsu WCSC35 の蒸留データ約19.6億局面（4ファイル）と、水匠10 の約1億局面（1ファイル）。
 
 ## S3. データパイプライン
 
@@ -583,6 +583,9 @@ info string Nuenagon eval: feature=RayPair_v0 network=RayPair_v0Network W=128 L1
 | 評価値 | `cp = round(z × eval_scale)`。詰みの値と重ならないよう ±(詰み値 − 1) にクリップ |
 
 - 負の値は直後の clamp で必ず0になるので、右シフトの丸め方向による差は出ない。
+- **round は「0から遠い方への四捨五入」**（C++ の `std::lround`。例：2.5 → 3、−2.5 → −3）。偶数への丸め（Python の `round`、numpy の `rint`）ではない。
+- 評価値は倍精度で `cp = round(raw × eval_scale / 8128)` と計算する（`raw` は最終出力の int32、8128 = 127 × 64、`eval_scale` はヘッダの f32 を倍精度にしたもの）。
+- この規則の正解データは、Shikibu の `tools/make_engine_golden.py` が作る（Nuenagon の N3 で使う）。
 - SIMD 向けの重みの並べ替えは自由。
 - 読み込み時の量子化にかかる時間は数ミリ秒の見込み（v0 で約192万要素）。
 
@@ -841,6 +844,13 @@ def digest(idx): return hashlib.sha256(",".join(map(str, idx)).encode()).hexdige
 | 特徴量 | RayPair_v0（15,000次元）と RayPair_v1（領域9区分、115,352次元）を両方定義 |
 | ネットワーク | v0：256→16→16→1、v1：256→32→32→1。活性化はすべて ClippedReLU |
 | 重みの受け渡し | float32（`.shk`）。量子化はエンジンが読み込み時に行う |
-| 教師データ | ponkotsu WCSC36 から蒸留した PSV 約40億局面。eval_scale はデータから推定し、ヘッダに記録 |
+| 教師データ | ponkotsu WCSC35 から蒸留した PSV 約19.6億局面（ほかに水匠10 約1億局面）。eval_scale はデータから推定し、ヘッダに記録 |
 | 学習環境 | Rust ＋ PyTorch、Google Colab（L4）、Drive からシャードを先読み |
 | エンジン | C++、Dainagon エンジンの盤面・指し手生成を流用・改造可、USI 対応（将棋所・ShogiGUI） |
+
+## 付録D　改訂履歴
+
+| 版 | 日付 | 内容 |
+|---|---|---|
+| v1.0 | 2026-10-20 | 初版 |
+| v1.1 | 2026-10-21 | 教師データの記述を実態に合わせて修正（WCSC36 → WCSC35、約40億 → 約20億局面）。§E4 に丸めの方向と評価値の計算式を明記。**凍結区画（第F部）の変更なし** |

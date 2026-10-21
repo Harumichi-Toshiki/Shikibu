@@ -12,6 +12,8 @@ Shikibu が読み書きするファイルの形式をまとめます。
 | `status.json` | JSON（1つ） | 学習（段階が変わるたびと、進捗を出すたび） | 監視ツール |
 | エンジン用の正解データ | JSON（1つ） | `tools/make_engine_golden.py` | Nuenagon の N3 |
 | シャード `shard_NNNNN.psv` | PSV と同じ | `shk_tools shuffle` | 学習 |
+| `train.lock` | JSON（1つ）。学習中だけある | 学習の開始時、10 秒ごとに書き直す | 学習の開始時（二重起動の確認） |
+| `config.toml` | TOML（ひな形を書き換えたもの） | ノートブックの節 5 | 学習器（`--config`） |
 
 ---
 
@@ -192,6 +194,26 @@ v1（W=128、L1=L2=32、特徴 115,352）の本体は、同じ計算で約 59MB�
 | `error` | 設定・データのエラーで終わった（`main` が `ValueError`・`RuntimeError`・`FileExistsError` を捕まえたとき） |
 
 確かめた例：`eval_scale` を設定で与えたとき、`history` は `data_check` → `train` → `done` でした。
+
+---
+
+## 5b. `train.lock`（二重起動の防止、M5.1）
+
+出力フォルダの `train.lock` は JSON です。学習器が、出力フォルダに何かを書く前に作ります。
+
+```json
+{"pid": 12345, "host": "ホスト名", "started": 1792563497.9, "heartbeat": 1792563527.9}
+```
+
+| キー | 内容 |
+|---|---|
+| `pid` | 学習器のプロセス番号 |
+| `host` | `socket.gethostname()` の値 |
+| `started` | 開始時刻（UNIX 時刻） |
+| `heartbeat` | 最後に書いた時刻（10 秒ごと。ファイルの更新時刻も同じ頃になる） |
+
+- 正常終了・エラー終了・SIGTERM で消えます。SIGKILL や電源断では残ります（次の起動で古いロックとして引き継がれる）。
+- 判定の規則は `docs/OPERATIONS.md` の 3 を参照してください。
 
 ---
 

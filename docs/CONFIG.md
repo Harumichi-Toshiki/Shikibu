@@ -24,6 +24,8 @@
 
 - `train_glob` も `train_paths` も空だと、`ValueError`（「data.train_paths か data.train_glob を指定する」）。
 - `train_glob` に当たるファイルが1つも無いと、`ValueError`（「学習データが1つも無い」）。
+- `train.log_every_steps` は 1 以上、`train.save_every_steps`・`train.val_every_steps` は 0 以上（0 は無効）、`train.progress_every_sec` は 0 以上。違反すると、キーの名前を含むエラーで終わる（M5.1）。
+- パスに `<…>` の目印が残っていると、「設定のひな形のまま」のエラーで、何も書かずに終わる（M5.1）。
 - `val_path` を書いたのに存在しないと、読み込みの時点で `ValueError` になる（事前の検査はしていない）。
 
 ---
@@ -97,29 +99,21 @@
 
 ---
 
-## Colab 用の設定（`configs/colab_v0.toml`・`configs/colab_v1.toml`）
+## ひな形（`configs/colab_v0.toml`・`configs/colab_v1.toml`）
 
-2つの違いは `model.network` と `output.out_dir` だけです。残りは同じ値です。
+リポジトリの設定は、利用者が使うための**ひな形**です。データの場所と出力先は、`<…>` の目印で書いてあります。
 
-| キー | 値 | 理由（ファイル冒頭のコメントより） |
+| キー | ひな形の値 | 書き換え |
 |---|---|---|
-| `data.train_glob` | `…/PonkotsuWCSC35_unique_*.psv`（Drive） | 学習用の PSV（約19.6億局面） |
-| `data.val_path` | `""` | 検証用の PSV が今の配置には無い |
-| `data.cache_dir` | `/content/shk_cache` | Colab のローカル SSD |
-| `data.max_cached` | 3 | |
-| `data.shuffle_buffer` | 20000000 | 約 800MB のメモリ |
-| `data.num_threads` | 11 | L4 ランタイムの論理コアに合わせる |
-| `train.batch_size` | 65536 | |
-| `train.lr` / `weight_decay` / `warmup_steps` | 1e-3 / 1e-4 / 1000 | 初期値。実測のあとで調整する |
-| `train.total_steps` / `max_steps` | 179000 / 179000 | 65,536 × 179,000 ≈ 117億局面（約6周） |
-| `train.min_lr_ratio` | 0.01 | |
-| `train.lam` | 0.75 | |
-| `train.eval_scale` | `"auto"` | |
-| `train.scale_sample` | 10000000 | |
-| `train.progress_every_sec` | 30.0 | |
-| `output.out_dir` | `/content/drive/MyDrive/shikibu/runs/colab_v0`（v1 は `colab_v1`） | Drive に保存する |
+| `data.train_glob` | `"/content/drive/MyDrive/<学習データのフォルダ>/*.psv"` | 学習用の PSV のパス（glob） |
+| `output.out_dir` | `"/content/drive/MyDrive/<出力のフォルダ>/runs/colab_v0"` | 出力フォルダ |
+| `data.val_path` | `""` | 検証用の PSV を用意したら指定する（空なら検証しない） |
+| `data.cache_dir` | `"/content/shk_cache"` | そのままでよい（Colab のローカル） |
+| `model.network` | `"RayPair_v0Network"`（v1 は `RayPair_v1Network`） | 特徴セットに合わせる |
 
-ノートブックは、`max_steps` の行だけを書き換えて `/content/run_config.toml` を作ります（リポジトリの設定は変えません）。
+- 学習の値（`batch_size`・`lr`・`total_steps`・`max_steps` など）は、データに合わせて調整してよい。
+- **`<…>` の目印が残っていると、学習器は「設定のひな形のまま」と表示して、何も書かずに終了コード 1 で止まります**（`train_paths`・`train_glob`・`val_path`・`cache_dir`・`out_dir` を見る）。
+- ノートブックは、設定セルの変数でこの目印を置き換えて、出力フォルダに `config.toml` を書き出してから使います。
 
 ---
 
@@ -143,7 +137,7 @@
 
 | 設定 | 起こること | 根拠 |
 |---|---|---|
-| `log_every_steps = 0` | `ZeroDivisionError` のトレースバックが出て終了（終了コード 1）。**検査はされていない** | 確認済み（`log_every_steps = 0` で実行） |
+| `log_every_steps = 0` | M5.1 で検査するようにした。0 は「train.log_every_steps は 1 以上」の設定エラーになる（旧い版は `ZeroDivisionError`） | 確かめた（テスト） |
 | `save_every_minutes = 0` | 時間による保存の条件が毎ステップ真になり、**毎ステップ保存**される（0 で「保存しない」ではない） | コードの読み（実行はしていない） |
 | `save_every_steps = 0` | 更新回数ごとの保存は行わない。時間による保存（`save_every_minutes`）と終了時の保存だけ | コードの読み |
 | `shuffle_buffer > 0` で再開 | 窓の中にあった局面は失われる（重複はしない） | `shk_feat` の仕様（REPORT_M2） |

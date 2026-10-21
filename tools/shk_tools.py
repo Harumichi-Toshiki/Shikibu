@@ -83,7 +83,11 @@ def main(argv=None):
     p.set_defaults(func=cmd_shuffle)
 
     args = parser.parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except ValueError as e:  # 入力の問題は、トレースバックを出さず「エラー:」で知らせる
+        print(f"エラー: {e}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

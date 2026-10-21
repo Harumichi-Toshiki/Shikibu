@@ -1,6 +1,6 @@
-# Shikibu / Nuenagon 設計書 v1.1
+# Shikibu / Nuenagon 設計書 v1.3
 
-- 作成日：2026-10-20（v1.1：2026-10-21）
+- 作成日：2026-10-20（v1.1〜v1.3：2026-10-21）
 - 作者：Harumichi-Toshiki
 - 対象：Shikibu（学習器）と Nuenagon（αβ探索エンジン）を実装する Claude Code
 - 同じ文書を両リポジトリの `docs/DESIGN.md` に置く。**両者の内容は常に完全に一致していなければならない。**
@@ -18,7 +18,7 @@
 | Dajo（太政） | Dainagon（DL・MCTS）と Nuenagon の合議 | — | `Dajo`（**本書の対象外**） |
 
 - Nuenagon は**単体の USI エンジン**として動き、将棋所・ShogiGUI に登録できること。
-- Dajo は別リポジトリで、Dainagon と Nuenagon を USI で呼び出して束ねる。本書では Nuenagon が満たすべき出力の約束（§E7）だけを定める。
+- Dajo は別リポジトリで、Dainagon と Nuenagon を呼び出して束ねる。本書では、両エンジンと Dajo の間の約束（USI の範囲：§E7、Dajo プロトコル DJP v0：§E9）を定める。
 
 ### 0.2 開発方針
 
@@ -297,9 +297,9 @@ z     = out_weight · h2 + out_bias                         # スカラー
 
 ## F5. 評価値スケール（eval_scale）
 
-- 教師データ（ponkotsu WCSC35 から蒸留した PSV）の評価値のスケールは不明なため、**学習器がデータから推定する**（推定方法は §S4）。
+- 教師データ（他のエンジンの評価値を付けた PSV）の評価値のスケールは、PSV に記録されていないため一般に不明である。そこで、**学習器がデータから推定する**（推定方法は §S4）。
 - 推定値、または手動で指定した値をヘッダの `eval_scale` に書く。学習時の教師勝率は `sigmoid(score / eval_scale)` で作る。
-- エンジンは評価値を `cp = z × eval_scale` で計算する。こうすると Nuenagon の cp が教師（ponkotsu）と同じ尺度になる。
+- エンジンは評価値を `cp = z × eval_scale` で計算する。こうすると Nuenagon の cp が教師と同じ尺度になる。
 - エンジンは USI オプション `EvalScale` で上書きできる（0 のときはファイルの値を使う）。
 
 ---
@@ -393,7 +393,7 @@ Shikibu/
 | 39 | u8 | padding |
 
 - PackedSfen のデコーダは Rust で自作する。**正しさの基準は cshogi**（`Board.set_psfen`）とし、テストで照合する（§S8-1）。
-- 総量は約20億局面（約82GB）。内訳は Ponkotsu WCSC35 の蒸留データ約19.6億局面（4ファイル）と、水匠10 の約1億局面（1ファイル）。
+- 総量は使うデータによる。数十億局面の規模を想定する（1局面40バイトなので、10億局面で約40GB）。
 
 ## S3. データパイプライン
 
@@ -503,8 +503,11 @@ Nuenagon/
   src/
     board/              # 盤面・指し手生成（Dainagon から流用）
     eval/raypair/       # 特徴量（全計算・差分更新）、重みの読み込み、量子化、推論
-    search/             # αβ探索
-    usi/                # USI プロトコル
+    search/             # αβ探索（ジョブ、スレッドプール、手ごとの記録、ヒント、パスの探索）
+    mate/               # 詰み探索（Dainagon から流用）
+    usi/                # USI プロトコル（ponder を含む）
+    djp/                # Dajo プロトコル（§E9）
+    sys/                # CPU の構成の取得、スレッドの論理CPUへの固定
   tests/
   bench/
 ```
@@ -513,29 +516,53 @@ Nuenagon/
 
 ### E2.1 対応コマンド
 
-`usi`, `isready`, `setoption`, `usinewgame`, `position`（`startpos` / `sfen`、`moves` 付き）, `go`（`btime` `wtime` `byoyomi` `binc` `winc` `infinite` `ponder` `nodes` `depth`）, `stop`, `ponderhit`, `gameover`, `quit`
+`usi`, `isready`, `setoption`, `usinewgame`, `position`（`startpos` / `sfen`、`moves` 付き）, `go`（`btime` `wtime` `byoyomi` `binc` `winc` `infinite` `ponder` `nodes` `depth` `mate`）, `stop`, `ponderhit`, `gameover`, `quit`
 
 - `usi` への応答：`id name Nuenagon`、`id author Harumichi-Toshiki`、オプション一覧、`usiok`。
 - 指し手が無い（負け）ときは `bestmove resign`、入玉宣言勝ちの条件を満たすときは `bestmove win`。
+- `USI_Ponder` が true で、読み筋が2手以上あるときは `bestmove <手> ponder <相手の予想手>` と返す。
 
-### E2.2 USI オプション
+### E2.2 ponder（相手の手番中の先読み）
+
+USI の標準どおりに実装する。
+
+1. GUI から `position … moves … <自分の手> <相手の予想手>` と `go ponder <持ち時間の指定>` が来たら、その局面の探索を始める。**時間の制限はかけない**（`infinite` と同じ扱い）。`bestmove` は出さない。
+2. `ponderhit` が来たら（予想が当たった）、その時点から、`go ponder` に付いていた持ち時間の指定で通常の時間管理に切り替える。すでに使った時間は、思考時間に含めない（相手の手番中の時間なので）。それまでに読んだ結果はそのまま使う。
+3. `stop` が来たら（予想が外れた）、直ちに `bestmove` を返す（GUI は無視する）。置換表の中身は残すので、次の探索で再利用される。
+4. ponder 中も `info` は通常どおり出す。
+
+### E2.3 USI オプション
 
 | 名前 | 型 | 既定値 | 内容 |
 |---|---|---|---|
-| `Threads` | spin | 4（1〜256） | 探索スレッド数 |
+| `Threads` | spin | 4（1〜256） | 探索スレッドの数（論理スレッド） |
+| `CpuAffinity` | string | `auto` | 探索スレッドを動かす論理CPUの番号。`auto`（OS に任せる）、または `0-7`・`0,2,4,6`・`8-15,24-31` のような範囲と列挙 |
+| `UsePhysicalCoresOnly` | check | false | true なら、1つの物理コアにつき論理CPUを1つだけ使う（SMT の兄弟を避ける）。`CpuAffinity` と併用したときは、その範囲の中から選ぶ |
 | `USI_Hash` | spin | 256（MB） | 置換表のサイズ |
 | `EvalFile` | string | `eval/nuenagon.shk` | 重みファイルのパス |
 | `EvalScale` | spin | 0（0〜10000） | 0 ならファイルの eval_scale を使う |
 | `NetworkDelay` | spin | 120（ms） | 通信遅延の見込み。思考時間から差し引く |
 | `USI_Ponder` | check | false | 先読み |
+| `MaxPly` | spin | 0（0〜10000） | 最大手数（この手数に達したら引き分け。0 なら制限なし）。大会の規則に合わせる |
+| `DrawValue` | spin | 0（−1000〜1000） | 引き分け（千日手・最大手数）の評価値（手番側から見た cp） |
 | `DebugCheckAccumulator` | check | false | 差分更新の検査（§E3.4） |
 
-### E2.3 起動時の動作
+### E2.4 CPU の割り当て
+
+1台の PC で Dainagon と Nuenagon を同時に動かすため、Nuenagon が使う CPU を指定できるようにする。
+
+- 起動時に CPU の構成（論理CPUの数、物理コアの数、各論理CPUがどの物理コアに属するか、NUMA ノード、SIMD 命令の対応）を調べ、`isready` の後に `info string` で出す。DJP の `dajo sysinfo` でも返す（§E9.6）。
+- 探索スレッドは、`CpuAffinity` と `UsePhysicalCoresOnly` で決まる論理CPUの集合に、1スレッドずつ固定する（Windows：`SetThreadGroupAffinity`、Linux：`pthread_setaffinity_np`）。スレッド数が集合の大きさを超える場合は、集合の中で順に割り当てる。
+- 64 を超える論理CPU（Windows のプロセッサグループ）にも対応する。
+- 割り当てに失敗しても探索は続ける（`info string` で警告を出し、OS に任せる）。
+
+### E2.5 起動時の動作
 
 `isready` で重みファイルを読み込み、検査（§F4.3）、量子化（§E4）を行ってから `readyok` を返す。読み込み後、次の形式で情報を出す。
 
 ```
-info string Nuenagon eval: feature=RayPair_v0 network=RayPair_v0Network W=128 L1=16 L2=16 eval_scale=XXX.X (file) 
+info string Nuenagon eval: feature=RayPair_v0 network=RayPair_v0Network W=128 L1=16 L2=16 eval_scale=XXX.X (file)
+info string Nuenagon cpu: logical=32 physical=16 simd=avx2,avx512,vnni threads=8 affinity=8-15
 ```
 
 `EvalScale` で上書きした場合は `(option)` と表示する。読み込みに失敗した場合は、理由を `info string` で出し、`readyok` を返さない。
@@ -589,19 +616,94 @@ info string Nuenagon eval: feature=RayPair_v0 network=RayPair_v0Network W=128 L1
 - SIMD 向けの重みの並べ替えは自由。
 - 読み込み時の量子化にかかる時間は数ミリ秒の見込み（v0 で約192万要素）。
 
-## E5. 探索（v0 の要件）
+## E5. 探索の構造（v0 の要件）
+
+探索部は、USI の `go` だけでなく、Dajo からの問い合わせ（§E9 の DJP）に答えられる作りにする。DJP の命令そのものは N6 で実装するが、**以下の構造は N4 の時点で用意しておく**（後から足すと作り直しになるため）。
+
+### E5.1 探索の手法
 
 - 反復深化、aspiration window、PVS（主要変化探索）
 - 置換表（`USI_Hash`）
 - null move pruning、LMR（遅延着手削減）、王手延長
 - 静止探索（駒を取る手、取り返し。王手がかかっている局面では全合法手）
-- 指し手の並べ替え：置換表の手、駒を取る手（MVV-LVA）、キラー手、履歴
-- 詰み探索：Dainagon の詰み探索を流用してよい
-- 千日手（連続王手の千日手を含む）、入玉宣言の判定
-- 時間管理：持ち時間＋加算（電竜戦本戦は 先手3分+2秒 ／ 後手10分+2秒）と秒読みに対応。`NetworkDelay` を差し引く
+- 指し手の並べ替え：置換表の手、駒を取る手（MVV-LVA）、キラー手、履歴、**ヒント（§E5.5）**
+- 詰み探索：Dainagon の詰み探索を流用してよい（§E5.7）
+- 千日手（連続王手の千日手を含む）、最大手数（`MaxPly`）、入玉宣言の判定。引き分けの評価は `DrawValue`
+- 時間管理：持ち時間＋加算（電竜戦本戦は 先手3分+2秒 ／ 後手10分+2秒）と秒読みに対応。`NetworkDelay` を差し引く。ponder に対応（§E2.2）
 - マルチスレッド：Lazy SMP
 
 速度目標は1スレッドあたり250万NPS。ただし本書の優先順位により、**正確さを損なう高速化はしない**。
+
+### E5.2 ジョブとスレッドプール
+
+- 探索は「ジョブ」の単位で行う。ジョブは、局面・種類（§E9.4）・制限（時間・ノード数・深さ）・使うスレッド数の上限・優先度を持つ。USI の `go` もジョブの1つ（番号0）として扱う。
+- 探索スレッドは起動時（と `Threads` の変更時）に作るスレッドプールにまとめ、ジョブに割り当てる。1つのジョブの中は Lazy SMP で並列化する。
+- 複数のジョブを同時に動かせる。スレッドが足りないときは、優先度の高いジョブから割り当て、残りは待たせる。ジョブが終わったスレッドは、待っているジョブ、または動いているジョブに回す。
+- ジョブは外から止められる（`stop`・`dajo cancel`）。止めた時点までの結果を返す。
+
+### E5.3 置換表の共有
+
+- 置換表は全ジョブで共有する。メインの探索で読んだ結果を、検証のジョブがそのまま使えるようにするため。
+- 世代（generation）を持ち、`usinewgame`・新しい局面での探索開始のたびに進める。古い世代の項目から置き換える。
+- パスした局面（§E5.6）の項目は、通常の局面と区別できるように、ハッシュ値に「パス済み」の印を混ぜる。
+
+### E5.4 ルートの手ごとの記録
+
+ルートの各合法手について、次を持つ。
+
+| 項目 | 内容 |
+|---|---|
+| `score` | 評価値（手番側から見た cp、内部の単位） |
+| `bound` | `exact`（正確な値）／`lower`（これ以上）／`upper`（これ以下） |
+| `depth` | その値を得た深さ（反復深化の段） |
+| `seldepth` | 最大の深さ |
+| `pv` | 読み筋 |
+| `nodes` | その手に使ったノード数 |
+
+この記録の上に、次の機能を作る。
+
+- **MultiPV**：上位 k 手を正確な値で求める。
+- **読む手の限定**：指定した手だけを読む（`searchmoves`）／指定した手を除く（`exclude`）。
+- **検証（probe）**：ある手の評価が閾値 T 以上かを、窓 [T−1, T] のゼロ幅探索で確かめる。反復深化で深くしながら、結果を「はい（下限 ≥ T）／いいえ（上限 < T）」として、深さとともに返す。「いいえ」のときは、相手の咎める手順を読み筋として返す。
+- **手ごとの正確な評価（rank）**：指定した手すべてを、同じ深さまで正確な値で求める（指定した手の数を k とした MultiPV と同じ）。
+
+### E5.5 ヒント（外部からの方策）
+
+- 局面（ハッシュ値）ごとに「手 → 確率」の表を持てるようにする（ヒントの表）。Dajo が `dajo hint`（§E9.5）で渡す。
+- 使い方：
+  1. 指し手の並べ替え：置換表の手、得な駒取りの次に、確率の高い順に読む。
+  2. LMR：確率が `hint_lmr_threshold`（既定 0.10）以上の手は減らさない。
+  3. ルートの最初の反復の順番。
+- ヒントの影響の強さは設定で変えられる（`dajo set hint_weight`。0 なら使わない）。ヒントは評価値そのものは変えない（並べ替えと枝刈りだけ）。
+- 表は `dajo hint clear`、`usinewgame` で消す。大きさには上限を設け（既定 65,536 局面）、古いものから捨てる。
+
+### E5.6 パスの探索
+
+- 「手番をパスした局面」（null move を指した局面）を、ジョブの起点にできるようにする。脅威の検出（threat）と、詰めろの検出（パスした後に相手の詰みがあるか）に使う。
+- 王手がかかっている局面ではパスできない（その場合のジョブはエラーを返す）。
+- 千日手の判定では、パスを1手として数えない。
+
+### E5.7 詰み探索
+
+- 詰み専用の探索（df-pn など）をジョブとして動かせるようにする。Dainagon の詰み探索を流用してよい。
+- 「手番側の詰み」と、「パスした後の相手の詰み（＝詰めろ）」の両方を調べられること。
+- 通常の探索でも、浅い詰み（1手・3手詰め程度）は各節点で調べてよい（実装は自由）。
+
+### E5.8 出来事の通知
+
+探索の中で次の出来事が起きたときに、通知を出せるようにする（USI では `info`、DJP では `dajo event`）。
+
+| 出来事 | 条件 |
+|---|---|
+| 反復の完了 | 反復深化の1段が終わった |
+| 最善手の交代 | 最善手が前の段と変わった |
+| 詰みの発見 | 詰みの評価値が出た（自分の勝ち・負けの両方） |
+| 評価の急変 | 最善の評価値が前の段から `swing` cp（既定150）以上変わった |
+| 脅威の発見 | threat ジョブで、損が `threat_min` cp（既定200）以上の脅威が見つかった |
+
+### E5.9 決定的モード
+
+`dajo set deterministic=1` のとき、1スレッドで、時間ではなくノード数で制限し、乱数を使わない。同じ入力に対して、毎回まったく同じ出力（評価値・読み筋・ノード数）を返す。DJP の動作を、決まった入出力の一覧でテストするため（§E6）。
 
 ## E6. テスト（必須）
 
@@ -609,30 +711,245 @@ info string Nuenagon eval: feature=RayPair_v0 network=RayPair_v0Network W=128 L1
 2. **差分更新**：自己対局または棋譜を使い、10万手以上で差分更新と全計算の蓄積値が毎手一致すること（駒取り・成り・駒打ち・玉移動・null move を含む）。
 3. **指し手生成（perft）**：平手初期局面から、深さ1〜5で 30 / 900 / 25,470 / 719,731 / 19,861,490 になること。
 4. **重みファイル**：Shikibu が書き出した `.shk` を読み込めること。ヘッダや CRC を壊したファイルは読み込みを拒否すること。
-5. **USI**：将棋所と ShogiGUI に登録して対局できること。
-6. **ベンチマーク**：`bench` コマンドで、固定の局面群を固定の深さまで探索したときの NPS を出す。
+5. **量子化と推論**：Shikibu の `tools/make_engine_golden.py` が作る正解データ（局面ごとの特徴・蓄積値・最終出力・評価値）と、1ビットも違わず一致すること。
+6. **USI**：将棋所と ShogiGUI に登録して対局できること。ponder（`go ponder` → `ponderhit`／`stop`）が正しく動くこと。
+7. **探索**：詰将棋の問題集を解けること。Nuenagon-toy v2（Python の試作）に、同じ持ち時間で大きく勝ち越すこと。
+8. **DJP**：決定的モード（§E5.9）で、決まった入出力の一覧（台本）どおりに応答すること。例：タダで駒を取られる手の `probe` が `verdict=no` と咎める手順を返す、詰めろの局面の `threat tsumero=1` が `tsumero=yes` を返す、詰将棋の局面の `mate` が正しい手数を返す、DJP を使っていても USI だけの GUI と問題なく対局できる。
+9. **CPU の割り当て**：`CpuAffinity` で指定した論理CPU以外でスレッドが動かないこと（OS の機能で確認）。
+10. **ベンチマーク**：`bench` コマンドで、固定の局面群を固定の深さまで探索したときの NPS を出す。
 
-## E7. Dajo 向けの約束
+## E7. Dajo 向けの約束（USI の範囲）
 
-Dajo（別リポジトリ）が Nuenagon の読みを使えるよう、次を守る。
+DJP を使わない場合でも Dajo が Nuenagon の読みを使えるよう、次を守る。
 
 - 反復深化の各深さの終わりと、`bestmove` の直前に、必ず次の形式の `info` を出す：
   `info depth <d> seldepth <sd> score cp <v> nodes <n> nps <nps> time <ms> pv <手順>`
   （詰みは `score mate <n>`）
 - `score cp` は手番側から見た値で、尺度は §F5（cp = z × eval_scale）。
 - `go infinite` → `stop` で、直ちに（目安100ms以内）`bestmove` を返す。
+- `MultiPV` オプション（既定1）に対応する。
 
 ## E8. 進め方
 
 | マイルストーン | 内容 |
 |---|---|
-| N1 | Dainagon からの盤面・指し手生成の移植、perft（テスト3） |
+| N1 | Dainagon からの盤面・指し手生成・詰み探索の移植、perft（テスト3） |
 | N2 | 特徴量の全計算、正解データ（テスト1） |
-| N3 | 重みの読み込み・量子化・推論（テスト4）、差分更新（テスト2） |
-| N4 | 探索、USI（テスト5）、ベンチマーク（テスト6） |
-| N5 | 時間管理の調整、マルチスレッド |
+| N3 | 重みの読み込み・量子化・推論（テスト4・5）、差分更新（テスト2） |
+| N4 | 探索の中核（§E5 の構造をすべて含む：ジョブ、スレッドプール、手ごとの記録、ヒントの表、パスの探索、出来事の通知、決定的モード）、USI と ponder（テスト6・7）、ベンチマーク（テスト10） |
+| N5 | 時間管理の調整、CPU の割り当て（テスト9） |
+| N6 | DJP v0（§E9）、台本によるテスト（テスト8） |
 
 - 本戦（11月半ば）に出すかどうかは 11/9 頃に判定する。条件は「Dajo が Dainagon 単体に負け越さないこと」。
+- 本戦に必要な DJP の最小構成は `hello`・`search`・`probe`・`threat`・`mate`・`cancel`・`set`・`sysinfo`。残り（`rank`・`hint`・`watch`・`promote`・`eval`）は、§E5 の構造が N4 にあれば軽く作れるので、時間があれば同時に入れる。
+
+## E9. Dajo プロトコル（DJP v0）
+
+Dajo（合議）が Nuenagon と Dainagon に、USI の範囲を超えた問い合わせをするための約束。**自由区画**だが、変更するときは版を上げ（§E9.2）、古い版の動作は残す。
+
+### E9.1 原則
+
+1. **USI と共存する。** エンジンはふつうの USI エンジンとして動き、将棋所・ShogiGUI に登録できる。`dajo hello` を受け取るまで、`dajo` で始まる命令は一切出さない。GUI は `dajo` を送らないので干渉しない。
+2. **文字の1行ずつ。** 標準入出力で、1行に1つの命令または応答を書く。`ssh` 越しでもそのまま使える。
+3. **ジョブ単位。** 問い合わせには番号を付け、応答にも同じ番号を付ける。複数のジョブを同時に投げられ、応答は番号で区別する。
+4. **局面はジョブが持つ。** 各ジョブの末尾に局面を書く。エンジン側に「今の局面」という状態を持たせない（取り違えの事故を防ぐため）。
+5. **値には必ず確かさを付ける。** 評価値には、正確な値か上限・下限か（`bound`）と、読んだ深さ（`depth`）を必ず付ける。
+6. **評価は cp と勝率の両方で返す。** `wr = 1 / (1 + exp(−cp / eval_scale))`（手番側から見た勝率）。詰みは勝ちなら 1、負けなら 0。Dainagon の勝率と比べやすくするため。
+
+### E9.2 有効化と版
+
+```
+→ dajo hello 0
+← dajo hello 0 engine=Nuenagon caps=search,rank,probe,threat,mate,eval,hint,watch,promote,sysinfo
+```
+
+- 数字はプロトコルの版。エンジンは自分が対応する版のうち、要求以下で最大のものを返す。対応できなければ `dajo error 0 code=version`。
+- `caps` は対応している機能の一覧（カンマ区切り）。Dajo は一覧にない命令を送らない。
+- `hello` は何度送ってもよい（版の確認だけ）。
+
+### E9.3 書式
+
+- 1行は、半角空白で区切った語の並び。最初の語は必ず `dajo`。
+- 引数は `キー=値`。値に空白を含めない。リストはカンマ区切り（例：`moves=7g7f,2g2f`）。
+- 指し手は USI の表記（`7g7f`、`P*5e`、`8h2b+`）。
+- 局面を書く命令では、**局面が最後**に来る：`position startpos [moves …]` または `position sfen <盤面> <手番> <持ち駒> <手数> [moves …]`（USI の `position` と同じ）。
+- ジョブの番号は 1〜2147483647 の整数。番号0は USI の `go` に使う（予約）。同じ番号を同時に2つ使わない。
+- 数値は10進数。時間はミリ秒、評価値は手番側から見た cp（§F5 の尺度）。
+- エンジンは知らないキーを無視する（新しい版のキーが来ても壊れないように）。知らない命令には `dajo error <番号> code=unknown_command` を返す。
+
+### E9.4 ジョブ
+
+```
+dajo job <番号> <種類> [キー=値 …] position …
+```
+
+共通のキー：
+
+| キー | 内容 | 既定 |
+|---|---|---|
+| `time` | 時間の上限（ms） | なし |
+| `nodes` | ノード数の上限 | なし |
+| `depth` | 深さの上限 | なし |
+| `infinite` | `1` なら止められるまで続ける（上限より優先） | 0 |
+| `threads` | 使うスレッド数の上限 | プールの全部 |
+| `priority` | 優先度（0〜9、大きいほど先） | 5 |
+| `report` | 途中経過を出す間隔（`iter`＝反復ごと、`none`＝最後だけ） | `iter` |
+
+上限がどれも無く、`infinite` でもないときは `dajo error <番号> code=no_limit` を返す。
+
+エンジンは受け付けたら `dajo accepted <番号>` を返す。スレッド待ちのときは `dajo queued <番号>`、動き始めたら `dajo started <番号>` を返す。最後に必ず `dajo result <番号> …`（§E9.7）を1回だけ返す。
+
+#### 種類ごとの中身
+
+**`search`**：ふつうの探索。
+
+| キー | 内容 |
+|---|---|
+| `multipv` | 上位 k 手を正確な値で求める（既定1） |
+| `searchmoves` | この手だけを読む |
+| `exclude` | この手を読まない |
+
+途中経過：反復ごとに、上位 k 手それぞれについて `dajo move`（§E9.7）を出す。結果：最善手と、上位 k 手の最終の値。
+
+**`rank`**：指定した手それぞれを、同じ深さまで正確な値で求める。
+
+| キー | 内容 |
+|---|---|
+| `moves` | 評価する手（省略時は全合法手） |
+
+結果：指定した手すべての `dajo move`（すべて同じ `depth` の `exact`）。時間切れで最後の段が終わっていなければ、最後に全手が終わった段の値を返す。
+
+**`probe`**：ある手の評価が閾値以上かを確かめる（§E5.4 の検証）。
+
+| キー | 内容 |
+|---|---|
+| `move` | 確かめる手（必須） |
+| `threshold` | 閾値 T（cp）。「この手の評価 ≥ T か」を確かめる |
+| `margin` | `threshold` の代わりに使う。Nuenagon が自分で最善の評価 B を求め（置換表と短い探索で）、T = B − margin とする |
+| `ref` | `margin` と併用。B を自分で求めず、この値を B として使う |
+| `mindepth` | この深さ未満の結論は `unknown` とする（既定4） |
+
+結果のキー：`verdict=yes|no|unknown`、`threshold=<T>`、`score`・`bound`・`depth`。`no` のときは `pv`（この手を指した後の、相手の咎める手順）も返す。
+
+**`threat`**：手番をパスしたとして、相手の脅威を調べる（§E5.6）。
+
+| キー | 内容 |
+|---|---|
+| `compare` | `1` なら、パスしない通常の探索も同じ深さで行い、差（損の大きさ）を返す |
+| `tsumero` | `1` なら、パスした後に相手の詰みがあるか（詰めろ）も詰み探索で調べる |
+
+結果のキー：`threat_move`（相手の最善手）、`score_pass`（パスした場合の手番側から見た評価）、`compare=1` なら `score_normal` と `gain = score_normal − score_pass`、`tsumero=1` なら `tsumero=yes|no|unknown` と、`yes` のとき `mate_pv`。王手がかかっている局面では `dajo error <番号> code=in_check`。
+
+**`mate`**：詰み探索（§E5.7）。
+
+| キー | 内容 |
+|---|---|
+| `side` | `self`（手番側が詰ませられるか）／`opponent`（パスした後、相手が詰ませられるか＝詰めろ） |
+
+結果のキー：`mate=yes|no|unknown`、`yes` なら `length`（手数）と `pv`。
+
+**`eval`**：局面の評価（探索しない）。
+
+```
+dajo job <番号> eval [qsearch=1] positions <局面1> | <局面2> | …
+```
+
+この種類だけは、局面を `position` ではなく `positions` の後に `|` 区切りで並べる。各局面は `startpos [moves …]` または `sfen … [moves …]`。結果：局面ごとに `dajo evalres <番号> index=<i> cp=<v> wr=<p>` を返し、最後に `dajo result`。`qsearch=1` なら静止探索の値、それ以外は評価関数の値。
+
+### E9.5 制御の命令
+
+| 命令 | 内容 | 応答 |
+|---|---|---|
+| `dajo cancel <番号>` | ジョブを止める。`all` なら全部 | 止めたジョブの `dajo result … status=cancelled` |
+| `dajo promote <番号> [time=…] [nodes=…] [depth=…]` | `infinite` で動いているジョブに上限を付ける。**DJP での ponder**：相手の予想手の局面を `infinite` で読ませておき、予想が当たったら promote で持ち時間を与える | `dajo promoted <番号>` |
+| `dajo hint probs=<手>:<確率>,… position …` | その局面のヒント（§E5.5）を登録する。何行でも送れる | なし |
+| `dajo hint clear` | ヒントを全部消す | なし |
+| `dajo watch on [events=…] [swing=…] [threat_min=…]` | 出来事の通知（§E5.8）を有効にする。`events` は `iter,best,mate,swing,threat` から選ぶ（既定は全部） | なし |
+| `dajo watch off` | 通知を止める | なし |
+| `dajo set <キー>=<値> …` | 設定を変える（下の表） | `dajo set ok` または `dajo error 0 code=bad_arg key=…` |
+| `dajo newgame` | 新しい対局（置換表の世代を進め、ヒントを消す） | なし |
+| `dajo sync` | それまでに送った命令がすべて処理されたら応答する | `dajo synced` |
+| `dajo sysinfo` | CPU の構成を返す | `dajo sysinfo logical=… physical=… numa=… simd=… threads=… affinity=…` |
+
+`dajo set` のキー：
+
+| キー | 内容 |
+|---|---|
+| `threads` | スレッドプールの大きさ（動いているジョブは、止めずに次の反復から反映） |
+| `affinity` | `CpuAffinity` と同じ書式 |
+| `physical_only` | `UsePhysicalCoresOnly` と同じ（0/1） |
+| `hash` | 置換表の大きさ（MB）。ジョブが動いていないときだけ |
+| `draw_value` | 引き分けの評価値 |
+| `max_ply` | 最大手数 |
+| `hint_weight` | ヒントの強さ（0〜1、既定1） |
+| `hint_lmr_threshold` | §E5.5 |
+| `deterministic` | 決定的モード（§E5.9） |
+| `eval_scale` | 勝率への変換に使うスケール（既定は重みファイルの値） |
+
+### E9.6 スレッドと CPU（1台の PC で合議するために）
+
+- Nuenagon の探索スレッドの総数はスレッドプールの大きさ（`Threads`／`dajo set threads`）で決まり、ジョブはその中から割り当てられる。
+- Dajo は、起動時に Nuenagon と Dainagon の `sysinfo` を見て、**互いに重ならない論理CPUの集合**を決め、Nuenagon には `dajo set affinity=…`、Dainagon には同等の設定（§E9.9）を送る。
+- 対局中に配分を変えてよい（例：相手の手番中は Dainagon の ponder に多く回す）。`dajo set threads=…` は、動いているジョブを止めずに次の反復から反映する。
+
+### E9.7 応答の共通の形
+
+```
+dajo move <番号> move=<手> score=<cp> wr=<勝率> bound=<exact|lower|upper> depth=<d> seldepth=<sd> nodes=<n> [mate=<±手数>] pv=<手,手,…>
+dajo info <番号> depth=<d> nodes=<n> nps=<nps> time=<ms> hashfull=<‰>
+dajo event <番号> type=<iter|best|mate|swing|threat> …（中身は出来事ごと）
+dajo result <番号> status=<done|cancelled|timeout|error> time=<ms> nodes=<n> …（種類ごとのキー）
+dajo error <番号> code=<コード> [key=…] [msg=<空白なしの説明>]
+```
+
+- `score` は手番側から見た cp。詰みは `mate=+n`（n 手で勝ち）／`mate=−n`（n 手で負け）を付け、`score` は ±30000 前後の詰みの値にする。
+- `time` はジョブを受け付けてからの経過時間。
+- エラーのコード：`unknown_command`、`bad_arg`、`version`、`no_limit`、`illegal_position`、`illegal_move`、`in_check`、`no_such_job`、`duplicate_id`、`busy`。
+
+### E9.8 例
+
+```
+→ dajo hello 0
+← dajo hello 0 engine=Nuenagon caps=search,rank,probe,threat,mate,eval,hint,watch,promote,sysinfo
+→ dajo set threads=8 affinity=8-15
+← dajo set ok
+→ dajo job 1 search infinite=1 threads=6 multipv=3 position startpos moves 7g7f 3c3d
+← dajo accepted 1
+← dajo started 1
+→ dajo job 2 probe move=8h2b+ margin=200 time=800 threads=2 position startpos moves 7g7f 3c3d
+← dajo accepted 2
+← dajo started 2
+← dajo move 1 move=2g2f score=35 wr=0.53 bound=exact depth=12 seldepth=18 nodes=2310455 pv=2g2f,8c8d,2f2e
+← dajo result 2 status=done time=640 nodes=1402211 verdict=yes threshold=-170 score=-120 bound=lower depth=11
+→ dajo cancel 1
+← dajo result 1 status=cancelled time=2051 nodes=5122011 bestmove=2g2f score=31 bound=exact depth=14
+```
+
+### E9.9 Dainagon 側の DJP（任意）
+
+Dainagon（MCTS）が DJP に対応すると、Dajo は Nuenagon の結果を Dainagon の探索に反映できる（協力の形 F）。Dainagon 側は、共同開発者の判断で対応するか、合議用に改造して対応する。対応しない場合、Dajo は USI の範囲（`MultiPV` と `info`）で取れる情報だけを使う。
+
+| 命令 | 内容 | 応答 |
+|---|---|---|
+| `dajo hello 0` | 有効化（§E9.2） | `dajo hello 0 engine=Dainagon caps=…` |
+| `dajo rootstats [top=k]` | 探索中または直前の探索のルートの統計 | 手ごとに `dajo root move=<手> visits=<n> q=<勝率> prior=<方策の確率>`、最後に `dajo rootstats_end total=<総訪問数>` |
+| `dajo treestats [top=k] [depth=d]` | ルートから深さ d までの主要な節点の統計（ヒントを作るため） | 節点ごとに `dajo node path=<手,手,…> visits=… q=… policy=<手>:<確率>,…`、最後に `dajo treestats_end` |
+| `dajo exclude moves=<手,…>` | 探索中のルートで、指定した手を以後選ばない | `dajo excluded` |
+| `dajo bias move=<手> value=<勝率の補正>` | ルートの指定した手の評価に補正を加える（例：Nuenagon が損を見つけた手を下げる） | `dajo biased` |
+| `dajo set threads=… affinity=…` | Dainagon が使う CPU スレッドと論理CPU（§E9.6） | `dajo set ok` |
+| `dajo sysinfo` | §E9.5 と同じ | 同じ |
+
+### E9.10 協力の形と、使う命令
+
+| 協力の形 | 中身 | 使う命令 |
+|---|---|---|
+| A. 拒否権（検証） | Dainagon の候補手に戦術的な咎めがないか確かめる | `probe`、`rank` |
+| B. 脅威の指摘 | 相手に手番を渡したら何をされるか（詰めろ・駒取りの狙い） | `threat`、`mate side=opponent` |
+| C. 詰みの委任 | 自分・相手の詰みを専用の探索で確かめる | `mate` |
+| D. 誘導 | Dainagon の方策を Nuenagon の並べ替えと枝刈りに使う | `hint`（＋Dainagon の `rootstats`・`treestats`） |
+| E. 時間の配分 | 一致すれば早く指し、割れたら延ばす | `watch`、`search`、`cancel` |
+| F. 逆方向の注入 | Nuenagon の結論を Dainagon の探索に反映する | Dainagon の `exclude`・`bias` |
+| G. ponder | 相手の予想手（Dainagon の上位の予想を複数でもよい）の局面を先に読んでおく | `search infinite=1`、`promote`、`cancel` |
 
 ---
 
@@ -844,13 +1161,18 @@ def digest(idx): return hashlib.sha256(",".join(map(str, idx)).encode()).hexdige
 | 特徴量 | RayPair_v0（15,000次元）と RayPair_v1（領域9区分、115,352次元）を両方定義 |
 | ネットワーク | v0：256→16→16→1、v1：256→32→32→1。活性化はすべて ClippedReLU |
 | 重みの受け渡し | float32（`.shk`）。量子化はエンジンが読み込み時に行う |
-| 教師データ | ponkotsu WCSC35 から蒸留した PSV 約19.6億局面（ほかに水匠10 約1億局面）。eval_scale はデータから推定し、ヘッダに記録 |
+| 教師データ | 他のエンジンの評価値を付けた PSV（蒸留データ）。どのデータを使うかは学習ごとに決める。eval_scale はデータから推定し、ヘッダに記録 |
 | 学習環境 | Rust ＋ PyTorch、Google Colab（L4）、Drive からシャードを先読み |
 | エンジン | C++、Dainagon エンジンの盤面・指し手生成を流用・改造可、USI 対応（将棋所・ShogiGUI） |
+| 合議の通信 | USI と共存する独自プロトコル DJP v0（文字の1行ずつ、ジョブ単位）。Dainagon 側は任意対応（対応できなければ合議用に改造） |
+| ponder | USI の標準どおり必須。DJP では infinite のジョブ＋promote で、複数の予想手にも対応 |
+| CPU | PC は1台。Nuenagon は使う論理CPU・物理コアのみの指定に対応し、Dainagon と重ならないよう Dajo が配分する |
 
 ## 付録D　改訂履歴
 
 | 版 | 日付 | 内容 |
 |---|---|---|
 | v1.0 | 2026-10-20 | 初版 |
-| v1.1 | 2026-10-21 | 教師データの記述を実態に合わせて修正（WCSC36 → WCSC35、約40億 → 約20億局面）。§E4 に丸めの方向と評価値の計算式を明記。**凍結区画（第F部）の変更なし** |
+| v1.1 | 2026-10-21 | 教師データの記述を修正。§E4 に丸めの方向と評価値の計算式を明記。**凍結区画（第F部）の変更なし** |
+| v1.2 | 2026-10-21 | ponder（§E2.2）と CPU の割り当て（§E2.3・§E2.4）を追加。探索の構造（§E5）を、ジョブ・スレッドプール・手ごとの記録・ヒント・パスの探索・出来事の通知・決定的モードを含む形に改訂。Dajo プロトコル DJP v0（§E9）を新設。テスト（§E6）と進め方（§E8）を更新（N6 を新設）。**凍結区画（第F部）の変更なし** |
+| v1.3 | 2026-10-21 | 特定の教師データ・保存場所に依存する記述を除き、汎用の書き方に改めた（§F5・§S2・付録C）。**凍結区画の定義（特徴量・ネットワーク・ファイル形式・正解データ）の変更なし** |

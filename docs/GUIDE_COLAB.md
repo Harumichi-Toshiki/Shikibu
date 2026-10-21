@@ -56,7 +56,9 @@ Drive に次の4つを置きます。
 
 Rust のソースを変えたときは、`shikibu_wheels/` の wheel を消してから、節 3 を実行し直します。
 
-wheel の名前には Python の版が入ります（例：`cp313`）。Colab の Python の版が変わると、古い wheel は入らなくなります（`pip` が「対応していない wheel」と言って止まる）。そのときは、wheel を消して作り直します。
+wheel の名前には Python の版が入ります（例：`cp313`）。Colab の Python の版が変わると、古い wheel は入りません。確かめた：`cp312` の名前の wheel を `pip` に渡すと、「対応していない wheel」として拒否されます。そのときは、wheel を消して作り直します。
+
+※ 節 3 は保存された wheel のうち一番新しいものを選ぶだけで、Python の版は見ません（`docs/DEVELOPMENT.md` の 5.4）。
 
 ### 節 4：設定を選ぶ（このセッションの量を決める）
 

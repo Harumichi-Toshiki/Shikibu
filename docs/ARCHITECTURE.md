@@ -66,6 +66,7 @@ Python からは `shikibu_feat` という名前で呼びます（`Cargo.toml` �
 
 | ファイル | 役割 |
 |---|---|
+| `lock.py` | 二重起動の防止（`train.lock`）。ロックの取得・心拍（10 秒ごと）・解放。古いロックの判定と、`--force-unlock` による引き継ぎ（M5.1） |
 | `networks.py` | ネットワークの定義（`RayPairNetwork`・`RayPair_v0Network`・`RayPair_v1Network`）。`NETWORKS` に名前で登録し、`build(name)` で作る。重みの名前は §F4.2 と同じ |
 | `train.py` | 学習ループ。設定の読み込み・検査（`load_config`・`validate`）、勝敗欠損の確認と eval_scale の決定、損失・オプティマイザ・学習率・重みのクリップ、保存と再開、ログ（`Status`・`JsonlLog`） |
 | `export.py` | `checkpoint.pt` → `.shk`（§F4）。書き出しのあとで読み直して確かめる。`read_shk` もここ |

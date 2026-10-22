@@ -1,11 +1,15 @@
 """重みファイル（.shk）の書き出しと読み込み（設計書 §F4）。
 
-使い方：python -m shikibu.export --checkpoint <checkpoint.pt> --out <file.shk>
+使い方：python -m shikibu.export --checkpoint <checkpoint.pt> --out <file>
+  - RayPair なら .shk を書く（§F4）。
+  - HalfKP（HalfKP_256Network・HalfKPf_256Network）なら、やねうら王の nn.bin を書き、
+    "FV_SCALE=<整数>" を表示する（§S11）。--fv-scale <整数> で FV_SCALE を指定できる。
 
 - 書き出しのあとで読み直し、ヘッダ・CRC32・全テンソルが一致することを確かめる。
-- すべてリトルエンディアン。本体は §F4.2 の順に float32 を隙間なく並べる。
+- .shk はすべてリトルエンディアン。本体は §F4.2 の順に float32 を隙間なく並べる。
 """
 import argparse
+import math
 import struct
 import sys
 import zlib
@@ -13,7 +17,7 @@ import zlib
 import numpy as np
 import torch
 
-from shikibu import networks
+from shikibu import networks, nnbin
 
 MAGIC = b"SHIKIBU\0"
 FORMAT_VERSION = 1
@@ -88,6 +92,8 @@ def export_shk(checkpoint_path, out_path):
     """checkpoint.pt から .shk を書き出し、読み直して確かめる。ヘッダの dict を返す。"""
     ck = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     m = networks.build(ck["network"], ft_width=ck["config"]["model"]["ft_width"])
+    if m.FEATURE_VERSION not in FEATURE_SETS:
+        raise ValueError(f"{ck['network']} は .shk に書けない（HalfKP は --out を nn.bin として書く）")
     m.load_state_dict(ck["model"])
     tensors = {k: v.numpy() for k, v in m.export_tensors().items()}
     body = b"".join(np.ascontiguousarray(tensors[k], dtype="<f4").tobytes() for k in ORDER)
@@ -113,12 +119,91 @@ def export_shk(checkpoint_path, out_path):
                                "eval_scale", "lam", "positions")}
 
 
+# ---------------------------------------------------------------- HalfKP（nn.bin）
+
+# やねうら王の出力の範囲の定数（Shikibu の量子化の式、§S11）
+FV_NUMER = 8128
+W_FT_SCALE, W_L_SCALE, B_SCALE = 127, 64, 8128
+
+
+def _round_away(x):
+    """0 から遠い方への四捨五入（§S11）。"""
+    return np.sign(x) * np.floor(np.abs(x) + 0.5)
+
+
+def _quant(x, scale, dtype):
+    info = np.iinfo(dtype)
+    return np.clip(_round_away(np.asarray(x, dtype=np.float64) * scale), info.min, info.max).astype(dtype)
+
+
+def _export_nnbin_from(ck, out_path, fv_scale=None):
+    m = networks.build(ck["network"], ft_width=ck["config"]["model"]["ft_width"])
+    if m.FEATURE_VERSION < 2:
+        raise ValueError(f"{ck['network']} は nn.bin に書けない（.shk を使う）")
+    m.load_state_dict(ck["model"])
+    eval_scale = float(ck["eval_scale"])
+    if fv_scale is None:
+        fv_scale = max(1, math.floor(FV_NUMER / eval_scale))
+    if fv_scale < 1:
+        raise ValueError(f"FV_SCALE は1以上: {fv_scale}")
+    s = eval_scale * fv_scale / FV_NUMER
+    if s > 1:
+        raise ValueError(f"FV_SCALE が大きすぎる（s = {s:.3f} > 1 になると、出力が範囲を超える）")
+
+    def val(k):
+        return ck["model"][k].detach().double().cpu().numpy()
+
+    w = val("ft.weight")
+    if m.FEATURE_VERSION == 3:
+        # 因数分解つき：玉の位置に関係ない特徴を、各玉の位置の特徴へ足す（§S11 の 1.）
+        n_half = nnbin.N_FEATURES
+        w = w[:n_half] + np.tile(w[n_half:], (81, 1))
+    tensors = {
+        "ft_b": _quant(val("ft_bias"), W_FT_SCALE, np.int16),
+        "ft_w": _quant(w, W_FT_SCALE, np.int16),
+        "b1": _quant(val("l1.bias"), B_SCALE, np.int32),
+        "w1": _quant(val("l1.weight"), W_L_SCALE, np.int8),
+        "b2": _quant(val("l2.bias"), B_SCALE, np.int32),
+        "w2": _quant(val("l2.weight"), W_L_SCALE, np.int8),
+        "bo": _quant(val("out.bias") * s, B_SCALE, np.int32),
+        "wo": _quant(val("out.weight") * s, W_L_SCALE, np.int8),
+    }
+    nnbin.write(out_path, tensors["ft_b"], tensors["ft_w"], tensors["b1"], tensors["w1"],
+                tensors["b2"], tensors["w2"], tensors["bo"], tensors["wo"])
+
+    # 読み直して確かめる
+    back = nnbin.read(out_path)
+    for k, v in tensors.items():
+        if not np.array_equal(back[k], v):
+            raise ValueError(f"書き出しの確認に失敗（{k}）")
+    return {"network": ck["network"], "eval_scale": eval_scale, "fv_scale": fv_scale}
+
+
+def export_nnbin(checkpoint_path, out_path, fv_scale=None):
+    """HalfKP の checkpoint.pt から nn.bin を書き出し、読み直して確かめる（§S11）。
+    戻り値は {"network", "eval_scale", "fv_scale"}。fv_scale が None なら floor(8128 / eval_scale)。"""
+    ck = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    return _export_nnbin_from(ck, out_path, fv_scale)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="python -m shikibu.export")
     p.add_argument("--checkpoint", required=True, help="学習の checkpoint.pt")
-    p.add_argument("--out", required=True, help="書き出す .shk のパス")
+    p.add_argument("--out", required=True, help="書き出すファイル（RayPair は .shk、HalfKP は nn.bin）")
+    p.add_argument("--fv-scale", type=int, default=None,
+                   help="HalfKP の FV_SCALE を指定する（省略時は floor(8128 / eval_scale)）")
     args = p.parse_args(sys.argv[1:] if argv is None else argv)
     try:
+        ck = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+        if networks.build(ck["network"], ft_width=ck["config"]["model"]["ft_width"]).FEATURE_VERSION >= 2:
+            info = _export_nnbin_from(ck, args.out, args.fv_scale)
+            print(f"書き出しました（nn.bin）: {args.out}")
+            print(f"  network: {info['network']}")
+            print(f"  eval_scale: {info['eval_scale']}")
+            print(f"FV_SCALE={info['fv_scale']}")
+            return 0
+        if args.fv_scale is not None:
+            raise ValueError("--fv-scale は HalfKP のネットワークのときだけ使う")
         h = export_shk(args.checkpoint, args.out)
     except (ValueError, OSError, RuntimeError) as e:
         print(f"エラー: {e}", file=sys.stderr)

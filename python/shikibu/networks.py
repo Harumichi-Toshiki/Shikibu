@@ -9,7 +9,7 @@ from torch import nn
 class RayPairNetwork(nn.Module):
     """共通部分。サブクラスで特徴数・第2層以降の幅を決める。"""
 
-    FEATURE_VERSION = None  # 0 = RayPair_v0、1 = RayPair_v1
+    FEATURE_VERSION = None  # 0・1 = RayPair、2 = HalfKP、3 = HalfKP（因数分解つき）
     NUM_FEATURES = None     # 特徴の次元数
     L1 = None
     L2 = None
@@ -77,9 +77,27 @@ class RayPair_v1Network(RayPairNetwork):
     L2 = 32
 
 
+class HalfKP_256Network(RayPairNetwork):
+    """HalfKP（やねうら王の halfkp_256x2-32-32）。計算式は RayPair と同じで、特徴と幅だけが違う（§S11）。"""
+    FEATURE_VERSION = 2
+    NUM_FEATURES = 125388
+    L1 = 32
+    L2 = 32
+
+
+class HalfKPf_256Network(RayPairNetwork):
+    """HalfKP の因数分解つき（HalfKP^）。学習のときだけ玉の位置に関係ない特徴を足す（§S11）。"""
+    FEATURE_VERSION = 3
+    NUM_FEATURES = 126936
+    L1 = 32
+    L2 = 32
+
+
 NETWORKS = {
     "RayPair_v0Network": RayPair_v0Network,
     "RayPair_v1Network": RayPair_v1Network,
+    "HalfKP_256Network": HalfKP_256Network,
+    "HalfKPf_256Network": HalfKPf_256Network,
 }
 
 

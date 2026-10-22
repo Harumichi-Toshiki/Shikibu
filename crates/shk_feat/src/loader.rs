@@ -27,6 +27,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
+use crate::feature;
 use crate::position;
 use crate::psv::{self, REC};
 use crate::raypair;
@@ -101,12 +102,13 @@ pub(crate) fn features_of(raw: &[u8], version: u8) -> Result<Features, String> {
         }
         let stm = pos.stm;
         let nstm = 1 - stm;
-        let pieces = raypair::Pieces::new(&pos);
+        // RayPair は局面の駒の一覧を両視点で使い回す（HalfKP は盤を直接読む）
+        let pieces = (version < 2).then(|| raypair::Pieces::new(&pos));
         f.stm_off.push(f.stm_idx.len() as i64);
-        raypair::features_from(&pieces, stm, version, &mut buf)?;
+        feature::side_features(&pos, pieces.as_ref(), stm, version, &mut buf)?;
         f.stm_idx.extend(buf.iter().map(|&i| i as i64));
         f.nstm_off.push(f.nstm_idx.len() as i64);
-        raypair::features_from(&pieces, nstm, version, &mut buf)?;
+        feature::side_features(&pos, pieces.as_ref(), nstm, version, &mut buf)?;
         f.nstm_idx.extend(buf.iter().map(|&i| i as i64));
         f.score.push(score as f32);
         f.result.push((result as f32 + 1.0) * 0.5);

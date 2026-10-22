@@ -1,0 +1,1527 @@
+diff --git a/configs/colab_lab.toml b/configs/colab_lab.toml
+new file mode 100644
+index 0000000..214235a
+--- /dev/null
++++ b/configs/colab_lab.toml
+@@ -0,0 +1,47 @@
++# Colab（L4）で、評価関数の構造を比べる実験（§S12）の設定のひな形。ノートブック notebooks/shikibu_lab.ipynb も同じ値を使う。
++# 使うときは、このファイルをコピーして、<…> の目印を自分の環境の値に書き換える。
++#   <学習データのフォルダ>：学習用の PSV（*.psv）が置いてあるフォルダ（Google Drive 上のパス）
++#   <検証データのフォルダ>/<検証用>.psv：検証用の PSV（1ファイル）。学習には使わない（train_glob に含まれていても除かれる）
++#   <出力のフォルダ>：実験の出力を置くフォルダ。構造ごとに分けること
++# 構造（model.network）は "<特徴>_<W>x2-<L1>-<L2>[_オプション]" の形で書く（README の「構造の名前」を参照）。
++# 比べるときは、構造以外の値（データ・検証データ・max_steps・バッチ・学習率）を全部同じにする。
++
++[data]
++train_glob = "/content/drive/MyDrive/<学習データのフォルダ>/*.psv"
++val_path = "/content/drive/MyDrive/<検証データのフォルダ>/<検証用>.psv"
++cache_dir = "/content/shk_cache"
++max_cached = 3
++shuffle_buffer = 20000000
++num_threads = 11
++
++[model]
++# 例：raypair0_128x2-16-16（今の RayPair）、halfkp_256x2-32-32_f、halfkahm2_512x2-16-32_f
++network = "halfkp_256x2-32-32_f"
++# 0 なら構造の名前の W に合わせる
++ft_width = 0
++
++[train]
++batch_size = 65536
++lr = 1e-3
++weight_decay = 1e-4
++warmup_steps = 1000
++total_steps = 20000
++max_steps = 20000
++min_lr_ratio = 0.01
++lam = 0.75
++eval_scale = "auto"
++scale_sample = 10000000
++allow_missing_results = false
++seed = 0
++device = "auto"
++torch_threads = 1
++deterministic = false
++save_every_steps = 0
++save_every_minutes = 30.0
++val_every_steps = 1000
++val_positions = 100000
++progress_every_sec = 30.0
++log_every_steps = 100
++
++[output]
++out_dir = "/content/drive/MyDrive/<出力のフォルダ>/lab/halfkp_256x2-32-32_f"
+diff --git a/crates/shk_feat/src/halfk.rs b/crates/shk_feat/src/halfk.rs
+new file mode 100644
+index 0000000..7216d25
+--- /dev/null
++++ b/crates/shk_feat/src/halfk.rs
+@@ -0,0 +1,209 @@
++//! HalfKP / HalfKA 系（やねうら王互換）と、玉の周りのブロック（RayPair-K）。プロトタイプ。
++
++use crate::position::Position;
++use crate::raypair;
++
++const BK: [u32; 14] = [0, 1, 2, 3, 4, 5, 7, u32::MAX, 4, 4, 4, 4, 6, 8];
++const HAND_BASE: [(u32, u32); 7] = [(1, 20), (39, 44), (49, 54), (59, 64), (69, 74), (79, 82), (85, 88)];
++const F_KING: u32 = 1548;
++const E_KING: u32 = 1629;
++
++#[derive(Clone, Copy)]
++struct Kind {
++    plane: u32,
++    nk: u32,
++    with_king: bool,
++    merge: bool,
++    mirror: bool,
++    factor: bool,
++}
++
++fn kind(version: u8) -> Option<Kind> {
++    let (plane, nk, with_king, merge, mirror) = match version {
++        2 | 3 => (1548, 81, false, false, false),
++        4 | 5 => (1710, 81, true, false, false),
++        6 | 7 => (1629, 81, true, true, false),
++        8 | 9 => (1710, 45, true, false, true),
++        10 | 11 => (1629, 45, true, true, true),
++        _ => return None,
++    };
++    Some(Kind { plane, nk, with_king, merge, mirror, factor: version % 2 == 1 })
++}
++
++pub fn num_features(version: u8) -> Result<u32, String> {
++    match version {
++        0 | 1 => raypair::num_features(version),
++        12 => Ok(15000 + 1392),
++        13 => Ok(115352 + 1392),
++        _ => {
++            let k = kind(version).ok_or_else(|| format!("未知の version: {version}"))?;
++            Ok(k.plane * k.nk + if k.factor { k.plane } else { 0 })
++        }
++    }
++}
++
++fn mir(sq: u32) -> u32 {
++    (8 - sq / 9) * 9 + sq % 9
++}
++
++fn halfk(pos: &Position, persp: u8, k: Kind, out: &mut Vec<u32>) -> Result<(), String> {
++    let mut bps: [u32; 40] = [0; 40];
++    let mut n = 0usize;
++    let mut ksq = u32::MAX;
++    for y in 0..9 {
++        for x in 0..9 {
++            if let Some(p) = pos.board[y][x] {
++                let ysq = ((8 - x) * 9 + y) as u32;
++                let vsq = if persp == 0 { ysq } else { 80 - ysq };
++                let mine = p.color == persp;
++                let bp = if p.pt == 7 {
++                    if mine {
++                        ksq = vsq;
++                    }
++                    if !k.with_king {
++                        continue;
++                    }
++                    (if mine { F_KING } else { E_KING }) + vsq
++                } else {
++                    let f = 90 + 162 * BK[p.pt as usize];
++                    (if mine { f } else { f + 81 }) + vsq
++                };
++                if n >= 40 {
++                    return Err("駒が多すぎる".into());
++                }
++                bps[n] = bp;
++                n += 1;
++            }
++        }
++    }
++    if ksq == u32::MAX {
++        return Err("玉がない".into());
++    }
++    for color in 0..2u8 {
++        for h in 0..7 {
++            let (fb, eb) = HAND_BASE[h];
++            let base = if color == persp { fb } else { eb };
++            for i in 0..pos.hands[color as usize][h] as u32 {
++                if n >= 40 {
++                    return Err("駒が多すぎる".into());
++                }
++                bps[n] = base + i;
++                n += 1;
++            }
++        }
++    }
++    let total = if k.with_king { 40 } else { 38 };
++    if n > total {
++        return Err("駒が多すぎる".into());
++    }
++    while n < total {
++        bps[n] = 0;
++        n += 1;
++    }
++    let mut kk = ksq;
++    let flip = k.mirror && ksq / 9 >= 5;
++    if flip {
++        kk = mir(ksq);
++    }
++    out.clear();
++    let nf = k.plane * k.nk;
++    for &b0 in &bps[..n] {
++        let mut b = b0;
++        if flip && b >= 90 {
++            b = 90 + ((b - 90) / 81) * 81 + mir((b - 90) % 81);
++        }
++        if k.merge && b >= E_KING {
++            b -= 81;
++        }
++        out.push(kk * k.plane + b);
++        if k.factor {
++            out.push(nf + b);
++        }
++    }
++    out.sort_unstable();
++    Ok(())
++}
++
++/// 玉の周りのブロック（区間 C）。視点座標で計算する。
++fn kingzone(pos: &Position, persp: u8, base: u32, out: &mut Vec<u32>) -> Result<(), String> {
++    let mut vb = [u8::MAX; 81];
++    let mut kings = [u32::MAX; 2];
++    for y in 0..9 {
++        for x in 0..9 {
++            if let Some(p) = pos.board[y][x] {
++                let (vy, vx) = if persp == 0 { (y, x) } else { (8 - y, 8 - x) };
++                let pc = p.pt + if p.color == persp { 0 } else { 14 };
++                vb[vy * 9 + vx] = pc;
++                if p.pt == 7 {
++                    kings[(p.color != persp) as usize] = (vy * 9 + vx) as u32;
++                }
++            }
++        }
++    }
++    for kk in 0..2 {
++        let k = kings[kk];
++        if k == u32::MAX {
++            return Err("玉がない".into());
++        }
++        let (ky, kx) = ((k / 9) as i32, (k % 9) as i32);
++        let mut o = 0u32;
++        for dy in -2..=2i32 {
++            for dx in -2..=2i32 {
++                if dy == 0 && dx == 0 {
++                    continue;
++                }
++                let (y, x) = (ky + dy, kx + dx);
++                let c = if !(0..9).contains(&y) || !(0..9).contains(&x) {
++                    28
++                } else {
++                    let v = vb[(y * 9 + x) as usize];
++                    if v == u8::MAX {
++                        o += 1;
++                        continue;
++                    }
++                    v as u32
++                };
++                out.push(base + kk as u32 * 696 + o * 29 + c);
++                o += 1;
++            }
++        }
++    }
++    Ok(())
++}
++
++/// 視点座標の玉のマス（y × 9 + x）。(手番側の玉（手番側の視点）, 相手の玉（相手の視点）)。
++pub fn king_squares(pos: &Position) -> Result<(i64, i64), String> {
++    let mut res = [-1i64; 2];
++    for y in 0..9 {
++        for x in 0..9 {
++            if let Some(p) = pos.board[y][x] {
++                if p.pt == 7 {
++                    let (vy, vx) = if p.color == 0 { (y, x) } else { (8 - y, 8 - x) };
++                    let i = (p.color != pos.stm) as usize;
++                    res[i] = (vy * 9 + vx) as i64;
++                }
++            }
++        }
++    }
++    if res[0] < 0 || res[1] < 0 {
++        return Err("玉がない".into());
++    }
++    Ok((res[0], res[1]))
++}
++
++/// どの版でも使える特徴の抽出。`pieces` は RayPair 用（使い回し）。
++pub fn extract(pos: &Position, pieces: &raypair::Pieces, persp: u8, version: u8, out: &mut Vec<u32>) -> Result<(), String> {
++    match version {
++        0 | 1 => raypair::features_from(pieces, persp, version, out),
++        12 | 13 => {
++            raypair::features_from(pieces, persp, version - 12, out)?;
++            kingzone(pos, persp, if version == 12 { 15000 } else { 115352 }, out)?;
++            out.sort_unstable();
++            Ok(())
++        }
++        _ => {
++            let k = kind(version).ok_or_else(|| format!("未知の version: {version}"))?;
++            halfk(pos, persp, k, out)
++        }
++    }
++}
+diff --git a/crates/shk_feat/src/lib.rs b/crates/shk_feat/src/lib.rs
+index 06e2253..d994b37 100644
+--- a/crates/shk_feat/src/lib.rs
++++ b/crates/shk_feat/src/lib.rs
+@@ -10,6 +10,7 @@ mod bench;
+ mod position;
+ mod psv;
+ mod raypair;
++mod halfk;
+ mod loader;
+ mod rng;
+ mod shuffle;
+@@ -19,11 +20,11 @@ fn to_py_err(msg: String) -> PyErr {
+     PyValueError::new_err(msg)
+ }
+ 
+-fn check_version(version: i64) -> PyResult<u8> {
++pub(crate) fn check_version(version: i64) -> PyResult<u8> {
+     match version {
+-        0 | 1 => Ok(version as u8),
++        0..=13 => Ok(version as u8),
+         _ => Err(PyValueError::new_err(format!(
+-            "version は 0 か 1: {version}"
++            "version は 0〜13: {version}"
+         ))),
+     }
+ }
+@@ -40,7 +41,7 @@ fn check_perspective(perspective: i64) -> PyResult<u8> {
+ /// 特徴量の次元数。version: 0 = RayPair_v0、1 = RayPair_v1。
+ #[pyfunction]
+ fn num_features(version: i64) -> PyResult<u32> {
+-    raypair::num_features(check_version(version)?).map_err(to_py_err)
++    halfk::num_features(check_version(version)?).map_err(to_py_err)
+ }
+ 
+ /// SFEN から特徴の多重集合（昇順・重複込み）を返す。
+@@ -49,7 +50,16 @@ fn extract_sfen(sfen: &str, perspective: i64, version: i64) -> PyResult<Vec<u32>
+     let persp = check_perspective(perspective)?;
+     let version = check_version(version)?;
+     let pos = position::parse_sfen(sfen).map_err(to_py_err)?;
+-    raypair::features(&pos, persp, version).map_err(to_py_err)
++    let mut out = Vec::new();
++    halfk::extract(&pos, &raypair::Pieces::new(&pos), persp, version, &mut out).map_err(to_py_err)?;
++    Ok(out)
++}
++
++/// 玉のマス（RayPair の視点座標）。(手番側の玉, 相手の玉)。
++#[pyfunction]
++fn king_squares_sfen(sfen: &str) -> PyResult<(i64, i64)> {
++    let pos = position::parse_sfen(sfen).map_err(to_py_err)?;
++    halfk::king_squares(&pos).map_err(to_py_err)
+ }
+ 
+ /// PSV（40バイト）を読む。戻り値は (sfen, score, move, gamePly, game_result)。
+@@ -65,7 +75,9 @@ fn extract_psv(rec: &[u8], perspective: i64, version: i64) -> PyResult<Vec<u32>>
+     let persp = check_perspective(perspective)?;
+     let version = check_version(version)?;
+     let (pos, _, _, _, _) = position::decode_psv(rec).map_err(to_py_err)?;
+-    raypair::features(&pos, persp, version).map_err(to_py_err)
++    let mut out = Vec::new();
++    halfk::extract(&pos, &raypair::Pieces::new(&pos), persp, version, &mut out).map_err(to_py_err)?;
++    Ok(out)
+ }
+ 
+ /// 計測用：PSV の先頭 `n` 局面（足りなければ循環）について、解読と両視点の特徴抽出を行い、
+@@ -115,6 +127,7 @@ fn shikibu_feat(m: &Bound<'_, PyModule>) -> PyResult<()> {
+     m.add_function(wrap_pyfunction!(num_features, m)?)?;
+     m.add_function(wrap_pyfunction!(extract_sfen, m)?)?;
+     m.add_function(wrap_pyfunction!(decode_psv, m)?)?;
++    m.add_function(wrap_pyfunction!(king_squares_sfen, m)?)?;
+     m.add_function(wrap_pyfunction!(extract_psv, m)?)?;
+     m.add_function(wrap_pyfunction!(bench_extract, m)?)?;
+     m.add_function(wrap_pyfunction!(stats::psv_stats, m)?)?;
+diff --git a/crates/shk_feat/src/loader.rs b/crates/shk_feat/src/loader.rs
+index fd13226..e178efb 100644
+--- a/crates/shk_feat/src/loader.rs
++++ b/crates/shk_feat/src/loader.rs
+@@ -22,7 +22,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+ use std::thread::{self, JoinHandle};
+ use std::time::{Duration, Instant};
+ 
+-use numpy::IntoPyArray;
++use numpy::{IntoPyArray, PyArrayMethods};
+ use pyo3::exceptions::{PyRuntimeError, PyValueError};
+ use pyo3::prelude::*;
+ use pyo3::types::{PyDict, PyList};
+@@ -80,6 +80,7 @@ pub(crate) struct Features {
+     nstm_off: Vec<i64>,
+     score: Vec<f32>,
+     result: Vec<f32>,
++    kings: Vec<i64>,
+ }
+ 
+ pub(crate) fn features_of(raw: &[u8], version: u8) -> Result<Features, String> {
+@@ -92,6 +93,7 @@ pub(crate) fn features_of(raw: &[u8], version: u8) -> Result<Features, String> {
+         nstm_off: Vec::with_capacity(n),
+         score: Vec::with_capacity(n),
+         result: Vec::with_capacity(n),
++        kings: Vec::with_capacity(2 * n),
+     };
+     let mut buf: Vec<u32> = Vec::with_capacity(FEATS_PER_POS);
+     for rec in raw.chunks_exact(REC) {
+@@ -103,13 +105,16 @@ pub(crate) fn features_of(raw: &[u8], version: u8) -> Result<Features, String> {
+         let nstm = 1 - stm;
+         let pieces = raypair::Pieces::new(&pos);
+         f.stm_off.push(f.stm_idx.len() as i64);
+-        raypair::features_from(&pieces, stm, version, &mut buf)?;
++        crate::halfk::extract(&pos, &pieces, stm, version, &mut buf)?;
+         f.stm_idx.extend(buf.iter().map(|&i| i as i64));
+         f.nstm_off.push(f.nstm_idx.len() as i64);
+-        raypair::features_from(&pieces, nstm, version, &mut buf)?;
++        crate::halfk::extract(&pos, &pieces, nstm, version, &mut buf)?;
+         f.nstm_idx.extend(buf.iter().map(|&i| i as i64));
+         f.score.push(score as f32);
+         f.result.push((result as f32 + 1.0) * 0.5);
++        let (a, b) = crate::halfk::king_squares(&pos)?;
++        f.kings.push(a);
++        f.kings.push(b);
+     }
+     Ok(f)
+ }
+@@ -486,6 +491,9 @@ fn to_dict<'py>(py: Python<'py>, f: Features) -> PyResult<Bound<'py, PyDict>> {
+     d.set_item("nstm_offsets", f.nstm_off.into_pyarray(py))?;
+     d.set_item("score", f.score.into_pyarray(py))?;
+     d.set_item("result", f.result.into_pyarray(py))?;
++    let nk = f.kings.len() / 2;
++    let k = numpy::PyArray1::from_vec(py, f.kings).reshape([nk, 2])?;
++    d.set_item("kings", k)?;
+     Ok(d)
+ }
+ 
+diff --git a/notebooks/shikibu_lab.ipynb b/notebooks/shikibu_lab.ipynb
+new file mode 100644
+index 0000000..2c2c01d
+--- /dev/null
++++ b/notebooks/shikibu_lab.ipynb
+@@ -0,0 +1,391 @@
++{
++ "cells": [
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "# Shikibu 実験室：評価関数の構造を選んで学習し、比べる（Colab 用）\n",
++    "\n",
++    "このノートブックでは、評価関数の**構造**（どんな特徴を使い、どれくらいの幅の層にするか）を、名前を1つ選ぶだけで切り替えて学習できます。\n",
++    "同じデータ・同じ学習量で学習した結果を、**検証の損失（val_loss）**で並べて比べられます。val_loss が小さいほど、教師の評価値と勝敗をよく当てています。\n",
++    "\n",
++    "**使い方の流れ**\n",
++    "\n",
++    "1. Google Drive をマウントし、設定セル（節 2）の `<…>` を自分の環境の値に書き換える。\n",
++    "2. 構造の一覧（節 5）を見て、`ARCH` に1つ選ぶ。\n",
++    "3. 学習を始め（節 7）、進み具合を見る（節 8）。\n",
++    "4. 構造を変えて 2〜3 を繰り返す。**比べるときは `MAX_STEPS`・データ・検証データを全部同じにする**こと。\n",
++    "5. 節 9 で結果を比べ、節 10 で良かったものを書き出す。\n",
++    "\n",
++    "**構造の名前の読み方**：`<特徴>_<W>x2-<L1>-<L2>[_オプション]`\n",
++    "\n",
++    "| 部分 | 意味 |\n",
++    "|---|---|\n",
++    "| 特徴 | `raypair0`・`raypair1`（独自の RayPair）、`raypair0k`・`raypair1k`（RayPair ＋ 玉の周り）、`halfkp`・`halfka1`・`halfka2`・`halfkahm1`・`halfkahm2`（やねうら王と同じ） |\n",
++    "| W | 第1層の幅（32 の倍数）。広いほど賢いが、エンジンでの計算が重くなる |\n",
++    "| L1・L2 | 2層目・3層目の幅（8 の倍数） |\n",
++    "| `_f` | 因数分解（halfk… だけ）。学習が速く進む。書き出すときに畳み込むので、エンジンの側は変わらない |\n",
++    "| `_psqt` | 駒の点数を直接足す項（独自。まだ書き出せない） |\n",
++    "| `_k3k3` | 両方の玉の段で層を 9 組から切り替える（独自。まだ書き出せない） |\n",
++    "\n",
++    "halfk… で `_psqt`・`_k3k3` の無い構造は、やねうら王の `nn.bin` に書き出して、やねうら王と Nuenagon でそのまま使えます。"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## 1. Google Drive をマウントする"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "# Google Drive を /content/drive にマウントする（Colab でだけ使える）\n",
++    "from google.colab import drive\n",
++    "drive.mount('/content/drive')"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## 2. 設定（ここだけ書き換える）\n",
++    "\n",
++    "`<…>` の目印を、自分の環境の値に書き換えてください。目印が残っていると、このセルでエラーになります。\n",
++    "\n",
++    "- `REPO_URL`・`BRANCH`・`REPO`：リポジトリの取得元と、Drive 上の置き場所。\n",
++    "- `WHEEL_DIR`：`shk_feat` の wheel の保存先（無ければ初回にビルドして保存する）。\n",
++    "- `DATA_GLOB`：学習用の PSV（`*.psv` のように glob で書く）。\n",
++    "- `VAL_PATH`：検証用の PSV（1ファイル）。**学習には使われません**（`DATA_GLOB` に含まれていても除かれます）。比べるときは、どの構造でも同じファイルを使ってください。\n",
++    "- `LAB_ROOT`：実験の出力の親フォルダ。構造ごとに `LAB_ROOT/<構造の名前>` が作られます。\n",
++    "- `ARCH`：学習する構造の名前（節 5 の一覧から選ぶ）。\n",
++    "- `MAX_STEPS`：更新回数。比べるときは全部の構造で同じにします。1 回の更新は `BATCH_SIZE` 局面です。"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "# ===== 設定：<…> の目印を、自分の環境の値に書き換える =====\n",
++    "REPO_URL = \"https://github.com/<GitHub のユーザー名>/Shikibu.git\"   # リポジトリの取得元（Drive に無いときだけ使う）\n",
++    "BRANCH = \"main\"                                                    # 取得するブランチ\n",
++    "REPO = \"/content/drive/MyDrive/<リポジトリを置くフォルダ>/Shikibu\"     # Drive 上のリポジトリの場所\n",
++    "WHEEL_DIR = \"/content/drive/MyDrive/<wheel を置くフォルダ>\"             # shk_feat の wheel の保存先\n",
++    "DATA_GLOB = \"/content/drive/MyDrive/<学習データのフォルダ>/*.psv\"        # 学習用の PSV\n",
++    "VAL_PATH = \"/content/drive/MyDrive/<検証データのフォルダ>/<検証用>.psv\"   # 検証用の PSV（1ファイル）\n",
++    "LAB_ROOT = \"/content/drive/MyDrive/<出力のフォルダ>/lab\"                # 実験の出力の親フォルダ\n",
++    "CACHE_DIR = \"/content/shk_cache\"                                     # ローカルの一時コピー先（Colab の /content）\n",
++    "\n",
++    "ARCH = \"halfkp_256x2-32-32_f\"   # 学習する構造（節 5 の一覧から選ぶ）\n",
++    "MAX_STEPS = 20000               # 更新回数（比べるときは全部の構造で同じにする）\n",
++    "BATCH_SIZE = 65536              # 1回の更新の局面数\n",
++    "VAL_EVERY_STEPS = 1000          # 検証の間隔（更新回数）\n",
++    "\n",
++    "# ===== 目印の確認（ここで止まったら、上の <…> を書き換える） =====\n",
++    "_settings = {\"REPO_URL\": REPO_URL, \"REPO\": REPO, \"WHEEL_DIR\": WHEEL_DIR, \"DATA_GLOB\": DATA_GLOB,\n",
++    "             \"VAL_PATH\": VAL_PATH, \"LAB_ROOT\": LAB_ROOT}\n",
++    "_left = [k for k, v in _settings.items() if \"<\" in v and \">\" in v]\n",
++    "if _left:\n",
++    "    raise ValueError(\"設定セルの <…> を書き換えてください: \" + \", \".join(_left))\n",
++    "print(\"設定を確認しました。\")"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## 3. リポジトリを取得（または更新）する"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "import os\n",
++    "import subprocess\n",
++    "import glob\n",
++    "import sys\n",
++    "\n",
++    "os.makedirs(WHEEL_DIR, exist_ok=True)\n",
++    "if os.path.isdir(os.path.join(REPO, \".git\")):\n",
++    "    subprocess.run([\"git\", \"-C\", REPO, \"fetch\", \"origin\", BRANCH], check=True)\n",
++    "    subprocess.run([\"git\", \"-C\", REPO, \"checkout\", BRANCH], check=True)\n",
++    "    subprocess.run([\"git\", \"-C\", REPO, \"pull\", \"origin\", BRANCH], check=True)\n",
++    "else:\n",
++    "    subprocess.run([\"git\", \"clone\", \"-b\", BRANCH, REPO_URL, REPO], check=True)\n",
++    "sys.path.insert(0, os.path.join(REPO, \"python\"))\n",
++    "sys.path.insert(0, os.path.join(REPO, \"tools\"))\n",
++    "print(\"リポジトリ:\", REPO, \"/ ブランチ:\", BRANCH)"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## 4. wheel（`shikibu_feat`）をインストールする\n",
++    "\n",
++    "- `WHEEL_DIR` に `shk_feat-*.whl` があれば、それを入れます（数秒）。\n",
++    "- 無ければ Rust を入れて wheel を作り、`WHEEL_DIR` に保存してから入れます（初回だけ、数分）。\n",
++    "- **リポジトリを更新して特徴の種類が増えたとき**（このノートブックを初めて使うときなど）は、`WHEEL_DIR` の古い wheel を消してから実行してください。下のセルは、古い wheel だと分かったら作り直します。"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "def build_wheel():\n",
++    "    if subprocess.run([\"bash\", \"-lc\", \"command -v cargo\"], capture_output=True).returncode != 0:\n",
++    "        subprocess.run(\"curl -sSf https://sh.rustup.rs | sh -s -- -y\", shell=True, check=True)\n",
++    "    env = dict(os.environ, PATH=os.path.expanduser(\"~/.cargo/bin\") + os.pathsep + os.environ[\"PATH\"])\n",
++    "    subprocess.run([\"pip\", \"install\", \"-q\", \"maturin\"], check=True)\n",
++    "    for old in glob.glob(os.path.join(WHEEL_DIR, \"shk_feat-*.whl\")):\n",
++    "        os.remove(old)\n",
++    "    subprocess.run([\"maturin\", \"build\", \"--release\", \"-m\", \"crates/shk_feat/Cargo.toml\", \"-o\", WHEEL_DIR],\n",
++    "                   cwd=REPO, env=env, check=True)\n",
++    "\n",
++    "wheels = sorted(glob.glob(os.path.join(WHEEL_DIR, \"shk_feat-*.whl\")), key=os.path.getmtime)\n",
++    "if not wheels:\n",
++    "    build_wheel()\n",
++    "    wheels = sorted(glob.glob(os.path.join(WHEEL_DIR, \"shk_feat-*.whl\")), key=os.path.getmtime)\n",
++    "subprocess.run([\"pip\", \"install\", \"-q\", \"--force-reinstall\", wheels[-1]], check=True)\n",
++    "\n",
++    "# 古い wheel（M7 より前）だと特徴の版 13 が無い。そのときは作り直す\n",
++    "check = subprocess.run([sys.executable, \"-c\", \"import shikibu_feat; shikibu_feat.num_features(13)\"], capture_output=True)\n",
++    "if check.returncode != 0:\n",
++    "    print(\"wheel が古いので作り直します（数分）\")\n",
++    "    build_wheel()\n",
++    "    wheels = sorted(glob.glob(os.path.join(WHEEL_DIR, \"shk_feat-*.whl\")), key=os.path.getmtime)\n",
++    "    subprocess.run([\"pip\", \"install\", \"-q\", \"--force-reinstall\", wheels[-1]], check=True)\n",
++    "\n",
++    "import torch\n",
++    "print(\"wheel:\", os.path.basename(wheels[-1]))\n",
++    "print(\"torch\", torch.__version__, \"/ GPU:\", torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"なし\")"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## 5. 構造を選ぶ\n",
++    "\n",
++    "用意してある構造（`lab.PRESETS`）の一覧です。ほかの名前（幅を変えたものなど）も自由に使えます。\n",
++    "\n",
++    "- `学習の次元`：第1層の行の数（因数分解の分を含む）。\n",
++    "- `重みの数`：学習する重みの数。多いほど GPU のメモリと時間を使います。\n",
++    "- `1局面の特徴`：1局面1視点で使う特徴の最大数。エンジンでの計算の重さの目安です。\n",
++    "- `書き出し`：`nn.bin`（やねうら王・Nuenagon）、`.shk`（Nuenagon）、`-`（まだ書き出せない。比べるだけ）。"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "import importlib\n",
++    "from shikibu import lab\n",
++    "importlib.reload(lab)\n",
++    "\n",
++    "def show(names):\n",
++    "    print(f\"{'構造の名前':34} {'学習の次元':>10} {'重みの数':>13} {'1局面の特徴':>8}  {'書き出し':8} 説明\")\n",
++    "    for n in names:\n",
++    "        d = lab.describe(n)\n",
++    "        print(f\"{d['canonical']:34} {d['train_features']:>10,} {d['params']:>13,} {d['max_active']:>8}  \"\n",
++    "              f\"{d['export_format'] or '-':8} {lab.PRESETS.get(d['canonical'], '')}\")\n",
++    "\n",
++    "show(lab.PRESETS)\n",
++    "print()\n",
++    "print(\"選んだ構造:\")\n",
++    "show([ARCH])"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## 6. 設定ファイルを作る\n",
++    "\n",
++    "選んだ構造の設定を `LAB_ROOT/<構造の名前>/config.toml` に書き出します。学習率などは既定値（`configs/colab_lab.toml` と同じ）です。\n",
++    "変えたいときは `OVERRIDES` に `\"セクション.キー\": 値` の形で書きます（例：`\"train.lr\": 5e-4`）。"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "OVERRIDES = {\n",
++    "    \"train.batch_size\": BATCH_SIZE,\n",
++    "    \"train.max_steps\": MAX_STEPS,\n",
++    "    \"train.total_steps\": MAX_STEPS,\n",
++    "    \"train.warmup_steps\": min(1000, MAX_STEPS // 10),\n",
++    "    \"train.lr\": 1e-3,\n",
++    "    \"train.weight_decay\": 1e-4,\n",
++    "    \"train.min_lr_ratio\": 0.01,\n",
++    "    \"train.val_every_steps\": VAL_EVERY_STEPS,\n",
++    "    \"train.val_positions\": 100000,\n",
++    "    \"train.save_every_minutes\": 30.0,\n",
++    "    \"train.progress_every_sec\": 30.0,\n",
++    "    \"train.log_every_steps\": 100,\n",
++    "    \"data.cache_dir\": CACHE_DIR,\n",
++    "    \"data.max_cached\": 3,\n",
++    "    \"data.shuffle_buffer\": 20000000,\n",
++    "    \"data.num_threads\": max(1, (os.cpu_count() or 2) - 1),\n",
++    "}\n",
++    "\n",
++    "name = lab.describe(ARCH)[\"canonical\"]\n",
++    "OUT_DIR = os.path.join(LAB_ROOT, name)\n",
++    "os.makedirs(OUT_DIR, exist_ok=True)\n",
++    "cfg = lab.make_config(name, train_glob=DATA_GLOB, out_dir=OUT_DIR, val_path=VAL_PATH, overrides=OVERRIDES)\n",
++    "CONFIG = lab.write_config(cfg, os.path.join(OUT_DIR, \"config.toml\"))\n",
++    "print(\"設定:\", CONFIG)\n",
++    "print(\"学習用の PSV:\", len(glob.glob(DATA_GLOB)), \"個（検証用のファイルは除かれます）\")\n",
++    "print(\"checkpoint:\", \"あり（続きから学習します）\" if os.path.exists(os.path.join(OUT_DIR, \"checkpoint.pt\")) else \"なし（最初から）\")"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## 7. 学習を裏で開始する\n",
++    "\n",
++    "- `checkpoint.pt` があれば続きから学習します（Colab が切れても、節 1〜6 を実行してからこのセルで再開できます）。\n",
++    "- 止めるときは `mon.stop()` を実行します。\n",
++    "- 切断の直後で、学習が動いていないのにロックが残っているときだけ `FORCE_UNLOCK = True` にします。"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "import shk_monitor as mon\n",
++    "\n",
++    "FORCE_UNLOCK = False\n",
++    "mon.start(CONFIG, repo=REPO, force=FORCE_UNLOCK)"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## 8. 進み具合を表示する\n",
++    "\n",
++    "15秒ごとに、進捗・残り時間・速さ・学習曲線を表示します。学習の間は、このセルを動かし続けてください。"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "mon.watch(CONFIG)"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## 9. 構造を比べる\n",
++    "\n",
++    "`LAB_ROOT` の下の全部の実験を、検証の損失で並べます。`共通の step` は、全部の実験で検証した最後の更新回数で、その時点の val_loss（`val_loss@共通`）で比べるのが公平です。\n",
++    "\n",
++    "- `eval_scale` が実験ごとに違うと、val_loss は比べられません（同じデータなら同じ値になります）。\n",
++    "- 差が 0.001 未満なら、ほぼ同じと考えてください。最後は、エンジンで対局させて確かめます。"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "runs = sorted(d for d in glob.glob(os.path.join(LAB_ROOT, \"*\")) if os.path.exists(os.path.join(d, \"checkpoint.pt\")))\n",
++    "rows = lab.compare_runs(runs)\n",
++    "print(f\"{'構造の名前':34} {'step':>8} {'局面数':>14} {'eval_scale':>10} {'val_loss@共通':>13} {'最後':>9} {'最良':>9}\")\n",
++    "for r in rows:\n",
++    "    f = lambda x: \"-\" if x is None else f\"{x:.5f}\"\n",
++    "    print(f\"{r['network']:34} {r['step']:>8,} {r['positions']:>14,} {r['eval_scale']:>10.1f} \"\n",
++    "          f\"{f(r['val_loss_at_common']):>13} {f(r['val_loss']):>9} {f(r['best_val_loss']):>9}\")\n",
++    "if rows:\n",
++    "    print(\"共通の step:\", rows[0][\"common_step\"])\n",
++    "\n",
++    "# 検証の損失の推移を描く\n",
++    "import json\n",
++    "import matplotlib.pyplot as plt\n",
++    "plt.figure(figsize=(8, 4.5))\n",
++    "for r in rows:\n",
++    "    log = [json.loads(x) for x in open(os.path.join(r[\"run_dir\"], \"log.jsonl\"), encoding=\"utf-8\") if x.strip()]\n",
++    "    v = [x for x in log if x.get(\"type\") == \"val\"]\n",
++    "    plt.plot([x[\"step\"] for x in v], [x[\"val_loss\"] for x in v], label=r[\"network\"])\n",
++    "plt.xlabel(\"step\")\n",
++    "plt.ylabel(\"val_loss\")\n",
++    "plt.legend(fontsize=8)\n",
++    "plt.grid(alpha=0.3)\n",
++    "plt.show()"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## 10. 書き出す\n",
++    "\n",
++    "選んだ構造（`ARCH`）の学習結果を `LAB_ROOT/<構造の名前>/export/` に書き出します。\n",
++    "\n",
++    "- **nn.bin**（halfk…）：やねうら王・Nuenagon の評価関数のフォルダに `nn.bin` として置き、エンジンの `FV_SCALE` を表示された値にします。\n",
++    "  やねうら王は、表示された `EDITION`（例：`YANEURAOU_ENGINE_NNUE_HALFKAHM2_512X2_16_32`）でビルドしたものを使います。\n",
++    "- **nuenagon.shk**（raypair）：Nuenagon の `EvalFile` に指定します（Nuenagon がその幅に対応していること）。\n",
++    "- 書き出せない構造（`_psqt`・`_k3k3`・`raypair…k`）は、理由を表示します。比べるのには使えます。"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "res = lab.export_run(OUT_DIR)\n",
++    "if res[\"format\"] is None:\n",
++    "    print(\"書き出せません:\", res[\"reason\"])\n",
++    "else:\n",
++    "    print(\"書き出しました:\", res[\"path\"])\n",
++    "    for k, v in res.items():\n",
++    "        if k not in (\"format\", \"path\"):\n",
++    "            print(f\"  {k}: {v}\")\n",
++    "    if res[\"format\"] == \"nn.bin\":\n",
++    "        print()\n",
++    "        print(f\"エンジンの設定：FV_SCALE = {res['fv_scale']}\")\n",
++    "        print(f\"やねうら王のビルド：make normal TARGET_CPU=AVX2 YANEURAOU_EDITION={res['yo_edition']}\")"
++   ]
++  }
++ ],
++ "metadata": {
++  "accelerator": "GPU",
++  "colab": {
++   "provenance": []
++  },
++  "kernelspec": {
++   "display_name": "Python 3",
++   "name": "python3"
++  },
++  "language_info": {
++   "name": "python"
++  }
++ },
++ "nbformat": 4,
++ "nbformat_minor": 0
++}
+\ No newline at end of file
+diff --git a/python/shikibu/export.py b/python/shikibu/export.py
+index 9f2d7fa..92b1e27 100644
+--- a/python/shikibu/export.py
++++ b/python/shikibu/export.py
+@@ -84,11 +84,19 @@ def read_shk(path):
+     return h, tensors
+ 
+ 
+-def export_shk(checkpoint_path, out_path):
+-    """checkpoint.pt から .shk を書き出し、読み直して確かめる。ヘッダの dict を返す。"""
++def _load(checkpoint_path):
+     ck = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+-    m = networks.build(ck["network"], ft_width=ck["config"]["model"]["ft_width"])
++    m = networks.build(ck["network"], ft_width=ck["config"]["model"]["ft_width"] or 128)
+     m.load_state_dict(ck["model"])
++    return ck, m
++
++
++def export_shk(checkpoint_path, out_path):
++    """checkpoint.pt から .shk を書き出し、読み直して確かめる。ヘッダの dict を返す。"""
++    ck, m = _load(checkpoint_path)
++    p = networks.parse_arch(networks.arch_of(ck["network"], m.ft_width))
++    if p["feature"] not in ("raypair0", "raypair1") or p["psqt"] or p["stacks"] != 1:
++        raise ValueError(f"この構造は .shk に書き出せない（.shk は RayPair_v0・v1 の psqt・k3k3 なしだけ）: {ck['network']}")
+     tensors = {k: v.numpy() for k, v in m.export_tensors().items()}
+     body = b"".join(np.ascontiguousarray(tensors[k], dtype="<f4").tobytes() for k in ORDER)
+     h = {"feature_set": FEATURE_SETS[m.FEATURE_VERSION], "network": ck["network"],
+@@ -113,19 +121,141 @@ def export_shk(checkpoint_path, out_path):
+                                "eval_scale", "lam", "positions")}
+ 
+ 
++# ---------- やねうら王の nn.bin（§S11・§S12） ----------
++
++NNBIN_VERSION = 0x7AF32F16
++YO_FEATURES = {
++    "halfkp": ("HalfKP(Friend)", 0x5D69D5B8, 1548, 81),
++    "halfka1": ("HalfKA1(Friend)", 0x5F134CB8, 1710, 81),
++    "halfka2": ("HalfKA2(Friend)", 0x5F234CB8, 1629, 81),
++    "halfkahm1": ("HalfKA_hm1(Friend)", 0x7F134CB8, 1710, 45),
++    "halfkahm2": ("HalfKA_hm2(Friend)", 0x7F234CB8, 1629, 45),
++}
++
++
++def _u32(x):
++    return x & 0xFFFFFFFF
++
++
++def _pad32(n):
++    return (n + 31) // 32 * 32
++
++
++def _round_away(x):
++    return np.sign(x) * np.floor(np.abs(x) + 0.5)
++
++
++def _q(x, scale, dtype):
++    info = np.iinfo(dtype)
++    return np.clip(_round_away(np.asarray(x, dtype=np.float64) * scale), info.min, info.max).astype(dtype)
++
++
++def nnbin_layout(feature, W, L1, L2):
++    """(構造の文字列, 特徴変換のハッシュ, ネットワークのハッシュ)。"""
++    name, fh, plane, nk = YO_FEATURES[feature]
++    ft = _u32(fh ^ (2 * W))
++
++    def aff(prev, o):
++        return _u32((0xCC03DAE4 + o) ^ (prev >> 1) ^ _u32(prev << 31))
++    h = _u32(0xEC42E90D ^ (2 * W))
++    h = _u32(0x538D24C7 + aff(h, L1))
++    h = _u32(0x538D24C7 + aff(h, L2))
++    net = aff(h, 1)
++    n = 2 * W
++    st = f"InputSlice[{n}(0:{n})]"
++    st = f"AffineTransformSparseInput[{L1}<-{n}]({st})"
++    st = f"ClippedReLU[{L1}]({st})"
++    st = f"AffineTransform[{L2}<-{L1}]({st})"
++    st = f"ClippedReLU[{L2}]({st})"
++    st = f"AffineTransform[1<-{L2}]({st})"
++    return f"Features={name}[{plane * nk}->{W}x2],Network={st}", ft, net
++
++
++def nnbin_support(arch):
++    """nn.bin に書き出せるなら None、書き出せないなら理由。"""
++    p = networks.parse_arch(arch)
++    if p["feature"] not in YO_FEATURES:
++        return f"nn.bin（やねうら王の形式）に書き出せるのは halfk… の特徴だけ（{p['feature']} は書き出せない）"
++    if p["psqt"] or p["stacks"] != 1:
++        return "psqt・k3k3 の構造は、まだ書き出せない（学習と val_loss の比較だけできる）"
++    return None
++
++
++def yo_arch(arch):
++    p = networks.parse_arch(arch)
++    return f"{p['feature']}_{p['W']}x2-{p['L1']}-{p['L2']}"
++
++
++def yo_edition(arch):
++    return "YANEURAOU_ENGINE_NNUE_" + yo_arch(arch).upper().replace("-", "_")
++
++
++def export_nnbin(checkpoint_path, out_path, fv_scale=None):
++    """checkpoint.pt からやねうら王の nn.bin を書く。"""
++    ck, m = _load(checkpoint_path)
++    arch = networks.arch_of(ck["network"], m.ft_width)
++    why = nnbin_support(arch)
++    if why:
++        raise ValueError(f"この構造は nn.bin に書き出せない: {why}")
++    p = networks.parse_arch(arch)
++    W, L1, L2 = p["W"], p["L1"], p["L2"]
++    _, _, plane, nk = YO_FEATURES[p["feature"]]
++    t = {k: v.double().numpy() for k, v in m.export_tensors().items()}
++    w = t["ft_weight"]
++    nf = plane * nk
++    if p["factorize"]:
++        w = w[:nf] + np.tile(w[nf:], (nk, 1))
++    es = float(ck["eval_scale"])
++    if fv_scale is None:
++        fv_scale = max(1, int(np.floor(8128.0 / es)))
++    fv_scale = int(fv_scale)
++    s = es * fv_scale / 8128.0
++    arch_str, ft_hash, net_hash = nnbin_layout(p["feature"], W, L1, L2)
++
++    def padded(a, cols):
++        out = np.zeros((a.shape[0], _pad32(cols)), dtype=np.int8)
++        out[:, :cols] = a
++        return out
++    a = arch_str.encode()
++    with open(out_path, "wb") as f:
++        f.write(struct.pack("<III", NNBIN_VERSION, _u32(ft_hash ^ net_hash), len(a)))
++        f.write(a)
++        f.write(struct.pack("<I", ft_hash))
++        f.write(_q(t["ft_bias"], 127, np.int16).astype("<i2").tobytes())
++        f.write(_q(w, 127, np.int16).astype("<i2").tobytes())
++        f.write(struct.pack("<I", net_hash))
++        f.write(_q(t["l1_bias"], 8128, np.int32).astype("<i4").tobytes())
++        f.write(padded(_q(t["l1_weight"], 64, np.int8), 2 * W).tobytes())
++        f.write(_q(t["l2_bias"], 8128, np.int32).astype("<i4").tobytes())
++        f.write(padded(_q(t["l2_weight"], 64, np.int8), L1).tobytes())
++        f.write(_q(t["out_bias"] * s, 8128, np.int32).astype("<i4").tobytes())
++        f.write(padded(_q(t["out_weight"] * s, 64, np.int8).reshape(1, L2), L2).tobytes())
++    return {"network": ck["network"], "arch": yo_arch(arch), "eval_scale": es, "fv_scale": fv_scale,
++            "yo_edition": yo_edition(arch)}
++
++
+ def main(argv=None):
+     p = argparse.ArgumentParser(prog="python -m shikibu.export")
+     p.add_argument("--checkpoint", required=True, help="学習の checkpoint.pt")
+-    p.add_argument("--out", required=True, help="書き出す .shk のパス")
++    p.add_argument("--out", required=True, help="書き出すファイルのパス（halfk… なら nn.bin、RayPair なら .shk）")
++    p.add_argument("--fv-scale", type=int, default=None, help="nn.bin の FV_SCALE（省略時は自動）")
+     args = p.parse_args(sys.argv[1:] if argv is None else argv)
+     try:
+-        h = export_shk(args.checkpoint, args.out)
++        ck = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
++        arch = networks.arch_of(ck["network"], ck["config"]["model"]["ft_width"] or 128)
++        if networks.parse_arch(arch)["feature"] in YO_FEATURES:
++            h = export_nnbin(args.checkpoint, args.out, args.fv_scale)
++            print(f"書き出しました: {args.out}")
++            print(f"FV_SCALE={h['fv_scale']}")
++            print(f"EDITION={h['yo_edition']}")
++        else:
++            h = export_shk(args.checkpoint, args.out)
++            print(f"書き出しました: {args.out}")
++        for k, v in h.items():
++            print(f"  {k}: {v}")
+     except (ValueError, OSError, RuntimeError) as e:
+         print(f"エラー: {e}", file=sys.stderr)
+         return 1
+-    print(f"書き出しました: {args.out}")
+-    for k, v in h.items():
+-        print(f"  {k}: {v}")
+     return 0
+ 
+ 
+diff --git a/python/shikibu/lab.py b/python/shikibu/lab.py
+new file mode 100644
+index 0000000..37b339d
+--- /dev/null
++++ b/python/shikibu/lab.py
+@@ -0,0 +1,132 @@
++"""評価関数の構造の実験室（設計書 §S12）。プロトタイプ。"""
++import copy
++import json
++import os
++
++import torch
++
++from shikibu import export, networks, train
++
++PRESETS = {
++    "raypair0_128x2-16-16": "今の RayPair_v0（基準。Nuenagon でそのまま使える）",
++    "raypair0_256x2-32-32": "RayPair_v0 の幅を広げたもの",
++    "raypair1_256x2-32-32": "RayPair_v1（領域つき）の幅を広げたもの",
++    "raypair0k_256x2-32-32": "RayPair_v0 ＋ 玉の周りのブロック（独自）",
++    "halfkp_256x2-32-32_f": "やねうら王の標準の HalfKP（広く使われている構造）",
++    "halfkp_512x2-16-32_f": "HalfKP の幅 512",
++    "halfkp_1024x2-8-32_f": "HalfKP の幅 1024",
++    "halfkahm2_256x2-32-32_f": "HalfKA_hm2（玉も特徴に入れ、左右を畳む）",
++    "halfkahm2_512x2-16-32_f": "HalfKA_hm2 の幅 512",
++    "halfkahm2_1024x2-8-32_f": "HalfKA_hm2 の幅 1024（重いが正確）",
++    "halfkahm2_512x2-16-32_f_psqt": "HalfKA_hm2 ＋ 駒の点数の直接の項（独自。まだ書き出せない）",
++    "halfkahm2_512x2-16-32_f_k3k3": "HalfKA_hm2 ＋ 玉の段で層を切り替える（独自。まだ書き出せない）",
++}
++
++
++def describe(name):
++    p = networks.parse_arch(name)
++    feat, W, L1, L2, S = p["feature"], p["W"], p["L1"], p["L2"], p["stacks"]
++    nf = networks.FEATURES[feat][2]
++    params = p["num_features"] * W + W + S * (L1 * 2 * W + L1 + L2 * L1 + L2 + L2 + 1)
++    if p["psqt"]:
++        params += p["num_features"] * S
++    max_active = {"halfkp": 38, "raypair0": 208, "raypair1": 208, "raypair0k": 256, "raypair1k": 256}.get(feat, 40)
++    why = export.nnbin_support(p["canonical"]) if feat in export.YO_FEATURES else "halfk… ではない"
++    yo = why is None
++    if yo:
++        fmt = "nn.bin"
++    elif feat in ("raypair0", "raypair1") and not p["psqt"] and S == 1:
++        fmt = ".shk"
++    else:
++        fmt = None
++    nnbin_bytes = None
++    if yo:
++        s, _, _ = export.nnbin_layout(feat, W, L1, L2)
++        nnbin_bytes = (12 + len(s.encode()) + 4 + 2 * W + 2 * W * nf + 4 + 4 * L1 + L1 * export._pad32(2 * W)
++                       + 4 * L2 + L2 * export._pad32(L1) + 4 + export._pad32(L2))
++    return {"canonical": p["canonical"], "feature": feat, "W": W, "L1": L1, "L2": L2,
++            "train_features": p["num_features"], "infer_features": nf, "params": params, "max_active": max_active,
++            "export_format": fmt, "yo_compatible": yo, "yo_arch": export.yo_arch(name) if yo else None,
++            "yo_edition": export.yo_edition(name) if yo else None, "nnbin_bytes": nnbin_bytes}
++
++
++def make_config(name, train_glob, out_dir, val_path="", overrides=None):
++    p = networks.parse_arch(name)
++    cfg = copy.deepcopy(train.DEFAULTS)
++    cfg["data"]["train_glob"] = train_glob
++    cfg["data"]["val_path"] = val_path
++    cfg["output"]["out_dir"] = out_dir
++    cfg["model"]["network"] = p["canonical"]
++    cfg["model"]["ft_width"] = p["W"]
++    for k, v in (overrides or {}).items():
++        sec, _, key = k.partition(".")
++        if sec not in cfg or key not in cfg[sec]:
++            raise ValueError(f"未知の設定: {k}")
++        cfg[sec][key] = v
++    return cfg
++
++
++def _toml(v):
++    if isinstance(v, bool):
++        return "true" if v else "false"
++    if isinstance(v, str):
++        return json.dumps(v, ensure_ascii=False)
++    if isinstance(v, list):
++        return "[" + ", ".join(_toml(e) for e in v) + "]"
++    return repr(v)
++
++
++def write_config(cfg, path):
++    with open(path, "w", encoding="utf-8") as f:
++        for sec, kv in cfg.items():
++            f.write(f"[{sec}]\n")
++            for k, v in kv.items():
++                f.write(f"{k} = {_toml(v)}\n")
++            f.write("\n")
++    return path
++
++
++def _log(run_dir):
++    with open(os.path.join(run_dir, "log.jsonl"), encoding="utf-8") as f:
++        return [json.loads(x) for x in f if x.strip()]
++
++
++def compare_runs(run_dirs):
++    info = []
++    for d in run_dirs:
++        ck = torch.load(os.path.join(d, "checkpoint.pt"), map_location="cpu", weights_only=False)
++        vals = [r for r in _log(d) if r.get("type") == "val"]
++        info.append((d, ck, vals))
++    common = None
++    for _, _, vals in info:
++        steps = {r["step"] for r in vals}
++        common = steps if common is None else common & steps
++    cs = max(common) if common else None
++    rows = []
++    for d, ck, vals in info:
++        rows.append({"run_dir": d, "network": ck["network"], "step": ck["step"],
++                     "positions": ck["step"] * ck["config"]["train"]["batch_size"], "eval_scale": float(ck["eval_scale"]),
++                     "val_loss": vals[-1]["val_loss"] if vals else None,
++                     "best_val_loss": min(r["val_loss"] for r in vals) if vals else None,
++                     "common_step": cs,
++                     "val_loss_at_common": next((r["val_loss"] for r in vals if r["step"] == cs), None)})
++    rows.sort(key=lambda r: (r["val_loss_at_common"] is None, r["val_loss_at_common"] or 0.0))
++    return rows
++
++
++def export_run(run_dir):
++    ckp = os.path.join(run_dir, "checkpoint.pt")
++    ck = torch.load(ckp, map_location="cpu", weights_only=False)
++    arch = networks.arch_of(ck["network"], ck["config"]["model"]["ft_width"] or 128)
++    d = describe(arch)
++    if d["export_format"] is None:
++        return {"format": None, "path": None, "reason": "この構造は、まだ書き出せない（学習と val_loss の比較だけできる）"}
++    out = os.path.join(run_dir, "export")
++    os.makedirs(out, exist_ok=True)
++    if d["export_format"] == "nn.bin":
++        path = os.path.join(out, "nn.bin")
++        r = export.export_nnbin(ckp, path)
++    else:
++        path = os.path.join(out, "nuenagon.shk")
++        r = export.export_shk(ckp, path)
++    return {"format": d["export_format"], "path": path, **r}
+diff --git a/python/shikibu/networks.py b/python/shikibu/networks.py
+index b6960ce..3142731 100644
+--- a/python/shikibu/networks.py
++++ b/python/shikibu/networks.py
+@@ -1,24 +1,76 @@
+-"""ネットワークの定義（設計書 §F3.1・§F3.2・§S5）。
++"""ネットワークの定義（設計書 §F3.1・§F3.2・§S5・§S11・§S12）。
+ 
+-名前からクラスを引けるように `NETWORKS` に登録する。計算式は §F3.2 のとおり。
++- 従来の名前（RayPair_v0Network など）は `NETWORKS` に登録したクラス。
++- 構造の名前（例 "halfkahm2_512x2-16-32_f"）は `parse_arch` で読み、`ArchNetwork` を作る。
+ """
++import re
++
+ import torch
+ from torch import nn
+ 
++# 特徴 → (版（因数分解なし）, 版（因数分解つき）, 次元, 1つの玉の位置あたりの駒の番号の数（因数分解の次元）)
++FEATURES = {
++    "raypair0": (0, None, 15000, None),
++    "raypair1": (1, None, 115352, None),
++    "halfkp": (2, 3, 125388, 1548),
++    "halfka1": (4, 5, 138510, 1710),
++    "halfka2": (6, 7, 131949, 1629),
++    "halfkahm1": (8, 9, 76950, 1710),
++    "halfkahm2": (10, 11, 73305, 1629),
++    "raypair0k": (12, None, 16392, None),
++    "raypair1k": (13, None, 116744, None),
++}
++OPTIONS = ("f", "psqt", "k3k3")
++_ARCH_RE = re.compile(r"^([a-z0-9]+)_(\d+)x2-(\d+)-(\d+)((?:_[a-z0-9]+)*)$")
++
++
++def parse_arch(name):
++    """構造の名前を読む。誤りなら ValueError。"""
++    if not isinstance(name, str):
++        raise ValueError(f"構造の名前は文字列: {name!r}")
++    s = name.strip().lower()
++    m = _ARCH_RE.match(s)
++    if not m:
++        raise ValueError(f"構造の名前の形が違う（例：halfkp_256x2-32-32_f）: {name}")
++    feat, W, L1, L2, opts = m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4)), m.group(5)
++    if feat not in FEATURES:
++        raise ValueError(f"未知の特徴 {feat}（使えるもの: {', '.join(FEATURES)}）: {name}")
++    if W % 32 or not 32 <= W <= 8192:
++        raise ValueError(f"W は 32 の倍数で 32〜8192: {W}（{name}）")
++    for nm, v in (("L1", L1), ("L2", L2)):
++        if v % 8 or not 8 <= v <= 1024:
++            raise ValueError(f"{nm} は 8 の倍数で 8〜1024: {v}（{name}）")
++    toks = [t for t in opts.split("_") if t]
++    for t in toks:
++        if t not in OPTIONS:
++            raise ValueError(f"未知のオプション {t}（使えるもの: f, psqt, k3k3）: {name}")
++    if len(set(toks)) != len(toks):
++        raise ValueError(f"オプションが重複している: {name}")
++    factorize = "f" in toks
++    v0, v1, nf, plane = FEATURES[feat]
++    if factorize and v1 is None:
++        raise ValueError(f"因数分解（f）は halfk… の特徴でだけ使える: {name}")
++    canon = f"{feat}_{W}x2-{L1}-{L2}" + "".join("_" + o for o in OPTIONS if o in toks)
++    return {"canonical": canon, "feature": feat, "W": W, "L1": L1, "L2": L2, "factorize": factorize,
++            "psqt": "psqt" in toks, "stacks": 9 if "k3k3" in toks else 1,
++            "version": v1 if factorize else v0, "num_features": nf + (plane if factorize else 0)}
++
+ 
+ class RayPairNetwork(nn.Module):
+     """共通部分。サブクラスで特徴数・第2層以降の幅を決める。"""
+ 
+-    FEATURE_VERSION = None  # 0 = RayPair_v0、1 = RayPair_v1
+-    NUM_FEATURES = None     # 特徴の次元数
++    FEATURE_VERSION = None
++    NUM_FEATURES = None
+     L1 = None
+     L2 = None
++    PSQT = False
++    STACKS = 1
++    NEEDS_KINGS = False
+ 
+     def __init__(self, ft_width=128):
+         super().__init__()
+         W = ft_width
+         self.ft_width = W
+-        # 第1層：視点で共有する。重複したインデックスは回数ぶん加算される（mode="sum"）
+         self.ft = nn.EmbeddingBag(self.NUM_FEATURES, W, mode="sum")
+         self.ft_bias = nn.Parameter(torch.zeros(W))
+         self.l1 = nn.Linear(2 * W, self.L1)
+@@ -29,8 +81,7 @@ class RayPairNetwork(nn.Module):
+     def _accumulate(self, indices, offsets):
+         return self.ft_bias + self.ft(indices, offsets)
+ 
+-    def forward(self, stm_indices, stm_offsets, nstm_indices, nstm_offsets):
+-        # 手番側を先に連結する（§F3.2）
++    def forward(self, stm_indices, stm_offsets, nstm_indices, nstm_offsets, kings=None):
+         x = torch.cat(
+             [self._accumulate(stm_indices, stm_offsets), self._accumulate(nstm_indices, nstm_offsets)],
+             dim=1,
+@@ -41,7 +92,6 @@ class RayPairNetwork(nn.Module):
+         return self.out(h).squeeze(1)
+ 
+     def _named_tensors(self):
+-        # §F4.2 の名前。書き出し（export.py）と同じ名前を使う
+         return {
+             "ft_weight": self.ft.weight,
+             "ft_bias": self.ft_bias,
+@@ -54,7 +104,6 @@ class RayPairNetwork(nn.Module):
+         }
+ 
+     def export_tensors(self):
+-        """重みを float32 の CPU テンソルの dict で返す（§F4.2 の名前と形）。"""
+         return {k: v.detach().float().cpu().clone() for k, v in self._named_tensors().items()}
+ 
+     @torch.no_grad()
+@@ -62,6 +111,18 @@ class RayPairNetwork(nn.Module):
+         for k, v in self._named_tensors().items():
+             v.copy_(d[k].to(device=v.device, dtype=v.dtype))
+ 
++    @torch.no_grad()
++    def clip_(self, limit):
++        """§F3.3 のクリップ。"""
++        self.ft.weight.clamp_(-1.0, 1.0)
++        self.ft_bias.clamp_(-1.0, 1.0)
++        for k in ("l1_weight", "l2_weight", "out_weight"):
++            self._named_tensors()[k].clamp_(-limit, limit)
++
++    def decay_parameters(self):
++        t = self._named_tensors()
++        return [t["l1_weight"], t["l2_weight"], t["out_weight"]]
++
+ 
+ class RayPair_v0Network(RayPairNetwork):
+     FEATURE_VERSION = 0
+@@ -77,13 +138,136 @@ class RayPair_v1Network(RayPairNetwork):
+     L2 = 32
+ 
+ 
++class HalfKP_256Network(RayPairNetwork):
++    FEATURE_VERSION = 2
++    NUM_FEATURES = 125388
++    L1 = 32
++    L2 = 32
++
++
++class HalfKPf_256Network(RayPairNetwork):
++    FEATURE_VERSION = 3
++    NUM_FEATURES = 126936
++    L1 = 32
++    L2 = 32
++
++
+ NETWORKS = {
+     "RayPair_v0Network": RayPair_v0Network,
+     "RayPair_v1Network": RayPair_v1Network,
++    "HalfKP_256Network": HalfKP_256Network,
++    "HalfKPf_256Network": HalfKPf_256Network,
++}
++_LEGACY_ARCH = {
++    "RayPair_v0Network": ("raypair0", 16, 16, ""),
++    "RayPair_v1Network": ("raypair1", 32, 32, ""),
++    "HalfKP_256Network": ("halfkp", 32, 32, ""),
++    "HalfKPf_256Network": ("halfkp", 32, 32, "_f"),
+ }
+ 
+ 
++def arch_of(name, ft_width=128):
++    """正規の構造の名前。従来の名前も変換する。"""
++    if name in _LEGACY_ARCH:
++        f, l1, l2, o = _LEGACY_ARCH[name]
++        return parse_arch(f"{f}_{ft_width}x2-{l1}-{l2}{o}")["canonical"]
++    return parse_arch(name)["canonical"]
++
++
++def zone_of(sq):
++    """玉の段の区分（y ≧ 6 → 0、3〜5 → 1、≦ 2 → 2）。sq は視点座標の y × 9 + x。"""
++    y = torch.div(sq, 9, rounding_mode="floor")
++    return (y < 6).long() + (y < 3).long()
++
++
++class ArchNetwork(nn.Module):
++    """構造の名前から作るネットワーク（§S12）。S = 1 のときは従来と同じ名前・形。"""
++
++    def __init__(self, name):
++        super().__init__()
++        p = parse_arch(name)
++        self.arch = p
++        self.ARCH = p["canonical"]
++        self.FEATURE_VERSION = p["version"]
++        self.NUM_FEATURES = p["num_features"]
++        self.ft_width = W = p["W"]
++        self.L1, self.L2 = p["L1"], p["L2"]
++        self.PSQT = p["psqt"]
++        self.STACKS = S = p["stacks"]
++        self.NEEDS_KINGS = S > 1
++        self.ft = nn.EmbeddingBag(self.NUM_FEATURES, W, mode="sum")
++        self.ft_bias = nn.Parameter(torch.zeros(W))
++        nn.init.normal_(self.ft.weight, 0.0, 0.01)
++        if S == 1:
++            self.l1 = nn.Linear(2 * W, self.L1)
++            self.l2 = nn.Linear(self.L1, self.L2)
++            self.out = nn.Linear(self.L2, 1)
++        else:
++            def stacked(i, o):
++                lin = [nn.Linear(i, o) for _ in range(S)]
++                w = nn.Parameter(torch.stack([x.weight.detach() for x in lin]))
++                b = nn.Parameter(torch.stack([x.bias.detach() for x in lin]))
++                return w, b
++            self.l1_weight, self.l1_bias = stacked(2 * W, self.L1)
++            self.l2_weight, self.l2_bias = stacked(self.L1, self.L2)
++            self.out_weight, self.out_bias = stacked(self.L2, 1)
++        if self.PSQT:
++            self.psqt = nn.EmbeddingBag(self.NUM_FEATURES, S, mode="sum")
++            nn.init.zeros_(self.psqt.weight)
++
++    def _named_tensors(self):
++        d = {"ft_weight": self.ft.weight, "ft_bias": self.ft_bias}
++        if self.STACKS == 1:
++            d.update({"l1_weight": self.l1.weight, "l1_bias": self.l1.bias, "l2_weight": self.l2.weight,
++                      "l2_bias": self.l2.bias, "out_weight": self.out.weight, "out_bias": self.out.bias})
++        else:
++            d.update({"l1_weight": self.l1_weight, "l1_bias": self.l1_bias, "l2_weight": self.l2_weight,
++                      "l2_bias": self.l2_bias, "out_weight": self.out_weight, "out_bias": self.out_bias})
++        if self.PSQT:
++            d["psqt_weight"] = self.psqt.weight
++        return d
++
++    export_tensors = RayPairNetwork.export_tensors
++    set_from_tensors = RayPairNetwork.set_from_tensors
++    clip_ = RayPairNetwork.clip_
++    decay_parameters = RayPairNetwork.decay_parameters
++
++    def forward(self, stm_indices, stm_offsets, nstm_indices, nstm_offsets, kings=None):
++        a = self.ft_bias + self.ft(stm_indices, stm_offsets)
++        b = self.ft_bias + self.ft(nstm_indices, nstm_offsets)
++        h0 = torch.clamp(torch.cat([a, b], dim=1), 0.0, 1.0)
++        if self.STACKS == 1:
++            h = torch.clamp(self.l1(h0), 0.0, 1.0)
++            h = torch.clamp(self.l2(h), 0.0, 1.0)
++            z = self.out(h).squeeze(1)
++            bucket = None
++        else:
++            if kings is None:
++                raise ValueError("k3k3 の構造には kings（玉のマス）が必要")
++            bucket = zone_of(kings[:, 0]) * 3 + zone_of(kings[:, 1])
++            idx = bucket[:, None, None]
++
++            def layer(h, w, bias):
++                # 全部の組で計算してから、局面ごとに組を選ぶ（重みを局面ごとに複製しない）
++                allh = torch.einsum("ni,soi->nso", h, w) + bias[None]
++                return allh.gather(1, idx.expand(-1, 1, w.shape[1]))[:, 0]
++            h = torch.clamp(layer(h0, self.l1_weight, self.l1_bias), 0.0, 1.0)
++            h = torch.clamp(layer(h, self.l2_weight, self.l2_bias), 0.0, 1.0)
++            z = layer(h, self.out_weight, self.out_bias)[:, 0]
++        if self.PSQT:
++            ps = self.psqt(stm_indices, stm_offsets)
++            pn = self.psqt(nstm_indices, nstm_offsets)
++            if bucket is None:
++                z = z + (ps[:, 0] - pn[:, 0]) * 0.5
++            else:
++                z = z + (ps.gather(1, bucket[:, None])[:, 0] - pn.gather(1, bucket[:, None])[:, 0]) * 0.5
++        return z
++
++
+ def build(name, ft_width=128):
+-    if name not in NETWORKS:
+-        raise ValueError(f"未登録のネットワーク: {name}（登録済み: {sorted(NETWORKS)}）")
+-    return NETWORKS[name](ft_width=ft_width)
++    if name in NETWORKS:
++        return NETWORKS[name](ft_width=ft_width)
++    try:
++        return ArchNetwork(name)
++    except ValueError as e:
++        raise ValueError(f"未登録のネットワーク: {name}（登録済み: {sorted(NETWORKS)}、または構造の名前。{e}）") from None
+diff --git a/python/shikibu/train.py b/python/shikibu/train.py
+index 5b7464b..cb4527f 100644
+--- a/python/shikibu/train.py
++++ b/python/shikibu/train.py
+@@ -34,7 +34,7 @@ LIMIT = 127.0 / 64.0  # §F3.3 の Linear の重みの範囲
+ PSV_BYTES = 40
+ SCALE_BLOCK = 10_000  # eval_scale の推定に使う局面を取り出す連続ブロックの長さ（局面数）
+ DECAY_PARAMS = ("l1.weight", "l2.weight", "out.weight")  # weight decay の対象（§S6）
+-BATCH_KEYS = ("stm_indices", "stm_offsets", "nstm_indices", "nstm_offsets", "score", "result")
++BATCH_KEYS = ("stm_indices", "stm_offsets", "nstm_indices", "nstm_offsets", "score", "result", "kings")
+ 
+ DEFAULTS = {
+     "data": {
+@@ -46,7 +46,7 @@ DEFAULTS = {
+         "shuffle_buffer": 0,
+         "num_threads": 1,
+     },
+-    "model": {"network": "RayPair_v0Network", "ft_width": 128},
++    "model": {"network": "RayPair_v0Network", "ft_width": 0},  # ft_width 0 = 名前に合わせる（従来の名前なら 128）
+     "train": {
+         "batch_size": 16384,
+         "lr": 1e-3,
+@@ -131,12 +131,24 @@ def validate(cfg):
+     if d["val_path"] and t["val_positions"] <= 0:
+         raise ValueError("val_positions は1以上")
+     eval_scale_setting(t["eval_scale"])
++    network_name(cfg["model"])
+     _check_min(t, "log_every_steps", 1)
+     _check_min(t, "save_every_steps", 0)  # 0 は無効
+     _check_min(t, "val_every_steps", 0)   # 0 は無効
+     _check_min(t, "progress_every_sec", 0.0)
+ 
+ 
++def network_name(m):
++    """model.network を確かめ、checkpoint に書く名前を返す（従来の名前はそのまま、構造の名前は正規の形）。"""
++    name = m["network"]
++    if name in networks.NETWORKS:
++        return name
++    p = networks.parse_arch(name)
++    if m.get("ft_width", 0) not in (0, p["W"]):
++        raise ValueError(f"model.ft_width（{m['ft_width']}）が構造の名前の W（{p['W']}）と違う: {name}")
++    return p["canonical"]
++
++
+ def eval_scale_setting(v):
+     """設定の eval_scale を解釈する。"auto" なら None、数値なら float。"""
+     if v == "auto":
+@@ -158,6 +170,10 @@ def train_paths(d):
+         paths = sorted(glob.glob(d["train_glob"]))
+     else:
+         paths = list(d["train_paths"])
++    if d.get("val_path"):
++        # 検証のファイルは学習に使わない（§S12.5）
++        val = os.path.realpath(d["val_path"])
++        paths = [x for x in paths if os.path.realpath(x) != val]
+     if not paths:
+         raise ValueError("学習データが1つも無い（data.train_paths / data.train_glob）")
+     return paths
+@@ -229,11 +245,8 @@ def restore_rng(st):
+ 
+ @torch.no_grad()
+ def clip_weights_(model):
+-    """§F3.3：各ステップの後に範囲へ収める。bias は対象外。"""
+-    model.ft.weight.clamp_(-1.0, 1.0)
+-    model.ft_bias.clamp_(-1.0, 1.0)
+-    for lin in (model.l1, model.l2, model.out):
+-        lin.weight.clamp_(-LIMIT, LIMIT)
++    """§F3.3：各ステップの後に範囲へ収める。bias・psqt は対象外。"""
++    model.clip_(LIMIT)
+ 
+ 
+ def compute_loss(z, score, result, eval_scale, lam):
+@@ -243,9 +256,9 @@ def compute_loss(z, score, result, eval_scale, lam):
+ 
+ 
+ def build_optimizer(model, lr, weight_decay):
+-    named = dict(model.named_parameters())
+-    decay = [named[k] for k in DECAY_PARAMS]
+-    no_decay = [p for k, p in named.items() if k not in DECAY_PARAMS]
++    decay = model.decay_parameters()
++    ids = {id(p) for p in decay}
++    no_decay = [p for p in model.parameters() if id(p) not in ids]
+     return torch.optim.AdamW(
+         [
+             {"params": decay, "weight_decay": weight_decay},
+@@ -282,7 +295,7 @@ def to_device(batch, device):
+ def evaluate(model, val, eval_scale, lam):
+     """検証：(val_loss, val_mse)。val_mse = mean((sigmoid(z) − sigmoid(score / eval_scale))²)。"""
+     model.eval()
+-    z = model(val["stm_indices"], val["stm_offsets"], val["nstm_indices"], val["nstm_offsets"])
++    z = model(val["stm_indices"], val["stm_offsets"], val["nstm_indices"], val["nstm_offsets"], kings=val["kings"])
+     loss = compute_loss(z, val["score"], val["result"], eval_scale, lam)
+     target = torch.sigmoid(val["score"] / eval_scale)
+     mse = ((torch.sigmoid(z) - target) ** 2).mean()
+@@ -354,6 +367,7 @@ class Trainer:
+         self.lam = float(t["lam"])
+         self.paths = train_paths(d)
+         self.saved_step = -1
++        self.network = network_name(m)
+         self.scale_used = None  # 勝敗の確認と推定に使った局面数（新規の学習でだけ決まる）
+ 
+         ck = None
+@@ -361,7 +375,7 @@ class Trainer:
+             if not resume:
+                 raise FileExistsError(f"{self.ckpt_path} がある。続けるなら --resume を付ける（上書きはしない）")
+             ck = torch.load(self.ckpt_path, map_location="cpu", weights_only=False)
+-            if ck["network"] != m["network"] or ck["lam"] != self.lam:
++            if ck["network"] != self.network or ck["lam"] != self.lam:
+                 raise ValueError("checkpoint の network / lam が設定と違う")
+         elif resume:
+             print("checkpoint.pt が無いので最初から学習します", file=sys.stderr)
+@@ -369,7 +383,7 @@ class Trainer:
+         self.device = pick_device(t["device"])
+         configure_runtime(t)
+         seed_everything(t["seed"])
+-        self.model = networks.build(m["network"], ft_width=m["ft_width"])
++        self.model = networks.build(self.network, ft_width=m["ft_width"] or 128)
+         self.version = self.model.FEATURE_VERSION
+         if shikibu_feat.num_features(self.version) != self.model.NUM_FEATURES:
+             raise RuntimeError("ネットワークの特徴数が shikibu_feat と一致しない")
+@@ -486,7 +500,7 @@ class Trainer:
+             "eval_scale": self.eval_scale,
+             "eval_scale_source": self.eval_scale_source,
+             "lam": self.lam,
+-            "network": self.cfg["model"]["network"],
++            "network": self.network,
+             "config": self.cfg,
+             "rng": rng_state(),
+             "file_perm": self.perm,
+@@ -501,7 +515,7 @@ class Trainer:
+ 
+     def _train_step(self, batch):
+         x = to_device(batch, self.device)
+-        z = self.model(x["stm_indices"], x["stm_offsets"], x["nstm_indices"], x["nstm_offsets"])
++        z = self.model(x["stm_indices"], x["stm_offsets"], x["nstm_indices"], x["nstm_offsets"], kings=x["kings"])
+         loss = compute_loss(z, x["score"], x["result"], self.eval_scale, self.lam)
+         lr = self.t["lr"] * lr_factor(self.step, self.t["warmup_steps"], self.t["total_steps"],
+                                       self.t["min_lr_ratio"])
+@@ -520,7 +534,7 @@ class Trainer:
+         self.log.write({
+             "type": "start", "step": self.step, "epoch": self.epoch, "resumed": self.step > 0,
+             "eval_scale": self.eval_scale, "eval_scale_source": self.eval_scale_source,
+-            "lam": self.lam, "network": self.cfg["model"]["network"], "device": str(self.device),
++            "lam": self.lam, "network": self.network, "device": str(self.device),
+             "n_files": len(self.paths), "scale_positions_used": self.scale_used, "config": self.cfg,
+         })
+ 

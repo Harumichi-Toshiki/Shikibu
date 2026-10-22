@@ -22,7 +22,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use numpy::IntoPyArray;
+use numpy::{IntoPyArray, PyArrayMethods};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -81,6 +81,8 @@ pub(crate) struct Features {
     nstm_off: Vec<i64>,
     score: Vec<f32>,
     result: Vec<f32>,
+    /// 手番側・相手側の玉のマス（2 個ずつ。バッチの "kings"）
+    kings: Vec<i64>,
 }
 
 pub(crate) fn features_of(raw: &[u8], version: u8) -> Result<Features, String> {
@@ -93,6 +95,7 @@ pub(crate) fn features_of(raw: &[u8], version: u8) -> Result<Features, String> {
         nstm_off: Vec::with_capacity(n),
         score: Vec::with_capacity(n),
         result: Vec::with_capacity(n),
+        kings: Vec::with_capacity(2 * n),
     };
     let mut buf: Vec<u32> = Vec::with_capacity(FEATS_PER_POS);
     for rec in raw.chunks_exact(REC) {
@@ -102,16 +105,19 @@ pub(crate) fn features_of(raw: &[u8], version: u8) -> Result<Features, String> {
         }
         let stm = pos.stm;
         let nstm = 1 - stm;
-        // RayPair は局面の駒の一覧を両視点で使い回す（HalfKP は盤を直接読む）
-        let pieces = (version < 2).then(|| raypair::Pieces::new(&pos));
+        // 局面の駒の一覧は両視点で使い回す
+        let pieces = raypair::Pieces::new(&pos);
         f.stm_off.push(f.stm_idx.len() as i64);
-        feature::side_features(&pos, pieces.as_ref(), stm, version, &mut buf)?;
+        feature::side_features(&pos, &pieces, stm, version, &mut buf)?;
         f.stm_idx.extend(buf.iter().map(|&i| i as i64));
         f.nstm_off.push(f.nstm_idx.len() as i64);
-        feature::side_features(&pos, pieces.as_ref(), nstm, version, &mut buf)?;
+        feature::side_features(&pos, &pieces, nstm, version, &mut buf)?;
         f.nstm_idx.extend(buf.iter().map(|&i| i as i64));
         f.score.push(score as f32);
         f.result.push((result as f32 + 1.0) * 0.5);
+        let (king_stm, king_nstm) = feature::king_squares(&pos)?;
+        f.kings.push(king_stm as i64);
+        f.kings.push(king_nstm as i64);
     }
     Ok(f)
 }
@@ -488,6 +494,8 @@ fn to_dict<'py>(py: Python<'py>, f: Features) -> PyResult<Bound<'py, PyDict>> {
     d.set_item("nstm_offsets", f.nstm_off.into_pyarray(py))?;
     d.set_item("score", f.score.into_pyarray(py))?;
     d.set_item("result", f.result.into_pyarray(py))?;
+    let n = f.kings.len() / 2;
+    d.set_item("kings", numpy::PyArray1::from_vec(py, f.kings).reshape([n, 2])?)?;
     Ok(d)
 }
 

@@ -1,6 +1,6 @@
 //! RayPair 特徴量（設計書 §F2）。`reference/raypair_ref.py` と同じ結果を出す。
 //!
-//! 計算は作業領域を使い回す（`features_into`）。ラインは定数表で持ち、局面ごとに確保しない。
+//! 計算は作業領域を使い回す（`features_from`）。ラインは定数表で持ち、局面ごとに確保しない。
 
 use crate::position::{Piece, Position};
 
@@ -151,13 +151,6 @@ pub fn num_features(version: u8) -> Result<u32, String> {
     Ok(B1_BASE + regions * B1_LOCAL + 112)
 }
 
-/// 視点 `persp`（0 = 先手、1 = 後手）から見た特徴の多重集合を昇順で返す（重複を含む）。
-pub fn features(pos: &Position, persp: u8, version: u8) -> Result<Vec<u32>, String> {
-    let mut out = Vec::with_capacity(208);
-    features_into(pos, persp, version, &mut out)?;
-    Ok(out)
-}
-
 /// 局面の駒の一覧。盤の昇順（`sq = y * 9 + x` の小さい順）に並ぶ。
 /// 両視点の特徴を作るとき、局面ごとに1回だけ作って使い回す。
 pub struct Pieces {
@@ -188,12 +181,7 @@ impl Pieces {
     }
 }
 
-/// `features` と同じ結果を `out` に書く（`out` の中身は消える）。`out` を使い回せば確保は起きない。
-pub fn features_into(pos: &Position, persp: u8, version: u8, out: &mut Vec<u32>) -> Result<(), String> {
-    features_from(&Pieces::new(pos), persp, version, out)
-}
-
-/// `Pieces` から視点 `persp` の特徴を `out` に書く（`features_into` と同じ結果）。
+/// `Pieces` から視点 `persp` の特徴を `out` に書く（`out` の中身は消える）。
 pub fn features_from(pieces: &Pieces, persp: u8, version: u8, out: &mut Vec<u32>) -> Result<(), String> {
     let regions = region_count(version)?;
     let n = pieces.n;

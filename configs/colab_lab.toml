@@ -1,0 +1,51 @@
+# Colab で、評価関数の構造を比べる実験（設計書 §S12）の設定のひな形。ノートブック notebooks/shikibu_lab.ipynb も同じ値を使う。
+# 使うときは、このファイルをコピーして、<…> の目印を自分の環境の値に書き換える。
+#   <学習データのフォルダ>：学習用の PSV（*.psv）が置いてあるフォルダ（Google Drive 上のパス）
+#   <検証データのフォルダ>/<検証用>.psv：検証用の PSV（1ファイル）。学習には使わない（train_glob に含まれていても除かれる）
+#   <出力のフォルダ>：実験の出力を置くフォルダ。構造ごとに分けること
+# 構造（model.network）は "<特徴>_<W>x2-<L1>-<L2>[_オプション]" の形で書く（README の「構造の名前」を参照）。
+# 比べるときは、構造以外の値（データ・検証データ・max_steps・バッチ・学習率・eval_scale・lam・seed）を全部同じにする。
+# <…> が残っていると、学習器は「設定のひな形のまま」と言って何も書かずに止まる。
+
+[data]
+# 学習用の PSV。周回ごとに、ファイルの順番を seed + 周回番号 で並べ替えて読む。
+train_glob = "/content/drive/MyDrive/<学習データのフォルダ>/*.psv"
+# 検証用の PSV。学習には使わない。val_loss はここで測る。
+val_path = "/content/drive/MyDrive/<検証データのフォルダ>/<検証用>.psv"
+cache_dir = "/content/shk_cache"
+max_cached = 3
+shuffle_buffer = 20000000
+num_threads = 11
+
+[model]
+# 例：raypair0_128x2-16-16（今の RayPair）、halfkp_256x2-32-32_f（やねうら王の標準）、halfkahm2_512x2-16-32_f
+network = "halfkp_256x2-32-32_f"
+# 0 なら構造の名前の W に合わせる（ふつうは 0 のままでよい）
+ft_width = 0
+
+[train]
+batch_size = 65536
+lr = 1e-3
+weight_decay = 1e-4
+warmup_steps = 1000
+total_steps = 20000
+max_steps = 20000
+min_lr_ratio = 0.01
+lam = 0.75
+eval_scale = "auto"
+scale_sample = 10000000
+allow_missing_results = false
+seed = 0
+device = "auto"
+torch_threads = 1
+deterministic = false
+save_every_steps = 0
+save_every_minutes = 30.0
+# 検証は一定の間隔で行う（比較のための val_loss）
+val_every_steps = 1000
+val_positions = 100000
+progress_every_sec = 30.0
+log_every_steps = 100
+
+[output]
+out_dir = "/content/drive/MyDrive/<出力のフォルダ>/lab/halfkp_256x2-32-32_f"

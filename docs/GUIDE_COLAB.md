@@ -175,3 +175,15 @@ python tools/make_engine_golden.py --shk <RUN_NAME>.shk --out golden.json --n 10
   - **途中で変えてはいけないもの**：`network`（`checkpoint.pt` と合わなくなる）、`lam`、`train_glob` のファイル数、`eval_scale`（無視される。変えたいときは別の出力フォルダで始める）。
   - 詳しくは `docs/CONFIG.md` の「再開（`--resume`）のときの規則」を参照してください。
 - 別の設定で最初から学習するときは、`RUN_NAME` を変えます（別の出力フォルダになる）。同じフォルダに `checkpoint.pt` が残っていると、`--resume` なしでは止まります。
+
+## 7. 構造を比べたいとき（実験室）
+
+評価関数の構造（特徴・幅・層）を変えて比べるときは、`notebooks/shikibu_lab.ipynb` を使います。
+同じデータ・同じ学習量で構造だけを変えて学習し、検証の損失（val_loss）で並べ、良かったものを書き出します。
+
+- 節 2 の `STRUCTURES` に比べる構造の名前を書きます（構造の名前の読み方は `README.md` を参照）。
+- 構造以外（`MAX_STEPS`・`BATCH_SIZE`・`VAL_EVERY`・データ・検証データ）は、構造の間で同じになります。
+- 学習は、構造ごとに順番に裏で走ります。進み具合は節 8 の `WATCH` に見たい構造の名前を書いて確かめます。
+- 節 9 の val_loss は「局面をどれだけ当てられるか」の目安です。強さは対局で確かめてください。
+- 節 10 で、書き出せる構造（`halfk…` の psqt・k3k3 なし → nn.bin、`raypair0・raypair1` → .shk）を書き出します。nn.bin のときは、表示される `FV_SCALE` と `EDITION` を控えてください。
+- 書き出せない構造（psqt・k3k3・`raypair…k`）は、学習と val_loss の比較だけできます。

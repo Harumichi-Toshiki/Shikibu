@@ -34,11 +34,14 @@
 
 | キー | 型 | 既定値 | 意味 | 関連 |
 |---|---|---|---|---|
-| `network` | 文字列 | `"RayPair_v0Network"` | `"RayPair_v0Network"` か `"RayPair_v1Network"`。比較実験用に `"HalfKP_256Network"`（版 2）と `"HalfKPf_256Network"`（版 3、因数分解つき）も選べる。特徴セットと層の大きさが決まる | §F3.1・§S11 |
-| `ft_width` | 整数 | `128` | 第1層の幅 W。凍結仕様は 128（HalfKP は 256）。**検査はしていない**。RayPair はふつう変えない | §F3.1・§S11 |
+| `network` | 文字列 | `"RayPair_v0Network"` | 従来の名前（`"RayPair_v0Network"`・`"RayPair_v1Network"`・`"HalfKP_256Network"`・`"HalfKPf_256Network"`）か、**構造の名前**（例：`"halfkahm2_512x2-16-32_f"`）。構造の名前は `<特徴>_<W>x2-<L1>-<L2>[_f][_psqt][_k3k3]` の形で、特徴・幅・層・オプションを決める。読み方は [README](../README.md) の「構造の名前の読み方」 | §F3.1・§S11・§S12 |
+| `ft_width` | 整数 | `0` | 第1層の幅 W。**`0` なら構造の名前の W（従来の名前なら 128 か 256）に合わせる**。構造の名前で W を書いたときは、`ft_width` は 0 か同じ値でなければならない（違えば `ValueError`）。RayPair はふつう変えない | §F3.1・§S11・§S12 |
 
-- `network` に登録されていない名前は `ValueError`（登録済みの名前が表示される）。
-- `ft_width` を 128 以外にした重みは、学習はできても §F4 の凍結仕様（W = 128）から外れる。ヘッダには W が書かれるので、エンジンが対応していなければ読み込みを拒否する（§E2.3・§F4.3）。
+- `network` が従来の名前でも構造の名前でもなければ `ValueError`（構造の名前の形、登録済みの名前、特徴・W・L1・L2・オプションの範囲を日本語で示す）。
+- 構造の名前の W は 32 の倍数（32〜8192）、L1・L2 は 8 の倍数（8〜1024）。オプションは `f`（halfk… だけ）・`psqt`・`k3k3`。同じオプションを 2 回書くと誤り。
+- checkpoint の `network` には、構造の名前を**正規の形**（小文字、オプションは `f` → `psqt` → `k3k3` の順）で書く。従来の名前は、そのまま書く。
+- 検証データ（`data.val_path`）は、`data.train_glob` や `data.train_paths` に含まれていても学習から除かれる（§S12.5）。
+- `ft_width` を 128 以外にした RayPair の重みは、学習はできても §F4 の凍結仕様（W = 128）から外れる。`.shk` のヘッダには W が書かれるので、エンジンが対応していなければ読み込みを拒否する（§E2.3・§F4.3）。
 
 ---
 
@@ -99,7 +102,7 @@
 
 ---
 
-## ひな形（`configs/colab_v0.toml`・`configs/colab_v1.toml`・`configs/colab_halfkp.toml`）
+## ひな形（`configs/colab_v0.toml`・`configs/colab_v1.toml`・`configs/colab_halfkp.toml`・`configs/colab_lab.toml`）
 
 リポジトリの設定は、利用者が使うための**ひな形**です。データの場所と出力先は、`<…>` の目印で書いてあります。
 
@@ -109,7 +112,7 @@
 | `output.out_dir` | `"/content/drive/MyDrive/<出力のフォルダ>/runs/colab_v0"` | 出力フォルダ |
 | `data.val_path` | `""` | 検証用の PSV を用意したら指定する（空なら検証しない） |
 | `data.cache_dir` | `"/content/shk_cache"` | そのままでよい（Colab のローカル） |
-| `model.network` | `"RayPair_v0Network"`（v1 は `RayPair_v1Network`。`colab_halfkp.toml` は `"HalfKPf_256Network"`、`ft_width = 256`） | 特徴セットに合わせる |
+| `model.network` | `"RayPair_v0Network"`（v1 は `RayPair_v1Network`。`colab_halfkp.toml` は `"HalfKPf_256Network"`、`ft_width = 256`。`colab_lab.toml` は構造の名前 `"halfkp_256x2-32-32_f"`、`ft_width = 0`） | 特徴セットに合わせる |
 
 - 学習の値（`batch_size`・`lr`・`total_steps`・`max_steps` など）は、データに合わせて調整してよい。
 - **`<…>` の目印が残っていると、学習器は「設定のひな形のまま」と表示して、何も書かずに終了コード 1 で止まります**（`train_paths`・`train_glob`・`val_path`・`cache_dir`・`out_dir` を見る）。

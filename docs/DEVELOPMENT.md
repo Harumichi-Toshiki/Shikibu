@@ -15,7 +15,7 @@ Shikibu を開発・変更する人（人間、または Claude Code）のため
 |---|---|
 | `docs/DESIGN.md` | 設計書（凍結区画の第F部を含む） |
 | `docs/COLAB.md` | Colab の方針 |
-| `tests/conftest.py`・`tests/test_m1_acceptance.py`・`tests/test_m2_acceptance.py`・`tests/test_m3_acceptance.py`・`tests/test_m4_acceptance.py` | 受け入れテスト |
+| `tests/conftest.py`・`tests/test_m1_acceptance.py`・`tests/test_m2_acceptance.py`・`tests/test_m3_acceptance.py`・`tests/test_m4_acceptance.py`・`tests/test_m51_acceptance.py`・`tests/test_m6_acceptance.py` | 受け入れテスト（M6 の参照実装は `tests/halfkp_ref.py`・`tests/halfkp_nnbin.py`） |
 | `tests/m2_data.py`・`tests/m3_data.py`・`tests/m4_ref.py`・`tests/golden/raypair_golden.json` | テスト用のデータと参照 |
 | `reference/raypair_ref.py` | 特徴量の参照実装（付録A） |
 | `perf/perf_check.py` | 速度の合格判定 |
@@ -82,8 +82,8 @@ python -m pytest -q tests
 python check_protected.py
 ```
 
-- 期待する結果：`73 passed`、`OK`。
-- 内訳：M1 34 件（`test_m1_acceptance.py`）、M2 15 件（`test_m2_acceptance.py`）、M3 13 件（`test_m3_acceptance.py`）、M4 11 件（`test_m4_acceptance.py`）。
+- 期待する結果：`100 passed`、`OK`。
+- 内訳：M1 34 件（`test_m1_acceptance.py`）、M2 15 件（`test_m2_acceptance.py`）、M3 13 件（`test_m3_acceptance.py`）、M4 11 件（`test_m4_acceptance.py`）、M5.1 15 件（`test_m51_acceptance.py`）、M6 12 件（`test_m6_acceptance.py`）。
 - この文書の作成時の実行：Python 3.13、PyTorch 2.14.1（CUDA 版の wheel、CPU で実行）、`73 passed in 62.27s`。
 
 テストの環境変数：
@@ -121,6 +121,7 @@ python perf/perf_check.py --profile colab                        # Colab 本番�
 | **M4** 書き出しと確認 | `.shk` の書き出しと読み直し、量子化の確認（`quantsim`）、エンジン用の正解データ、進捗表示（`status.json`・ETA）、周回ごとのファイル順 | 73 件通過。Colab の本番は未実行（報告時点） | `REPORT_M4.md` |
 | **M5** 文書整備 | 利用者と開発者のための文書（この文書群）。コードは変えない | — | `REPORT_M5.md` |
 | **M5.1** 汎用化と不具合の修正 | 特定の利用者・データへの依存を取り除く（設定はひな形、ノートブックは設定セル）。ロック（`train.lock`）、設定の検査、`shk_tools shuffle` の表示、`.gitignore` | 88 件通過（M1〜M4 の 73 件と、M5.1 の 15 件）。`REPORT_M51.md` |
+| **M6** HalfKP の学習（比較実験用） | HalfKP（版 2）と因数分解つき（版 3）の特徴、`HalfKP_256Network`・`HalfKPf_256Network`、やねうら王の `nn.bin` の書き出し（`FV_SCALE` の表示）、HalfKP のひな形とノートブック | 100 件通過（M1〜M5.1 の 88 件と、M6 の 12 件）。`REPORT_M6.md` |
 
 ### 4.1 各マイルストーンで決まったこと（要点）
 

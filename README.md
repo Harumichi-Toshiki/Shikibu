@@ -20,9 +20,9 @@ Shikibu は、将棋の USI 探索エンジン **Nuenagon** が使う評価関�
 
 - PSV の統計、勝敗が記録されているかの判定、評価値の尺度（eval_scale）の推定
 - 事前シャッフルとシャード分割
-- Rust による特徴抽出（RayPair_v0 / v1）と、並列のバッチ生成（再開・キャッシュ対応）
+- Rust による特徴抽出（RayPair_v0 / v1、比較実験用の HalfKP と、その因数分解つき）と、並列のバッチ生成（再開・キャッシュ対応）
 - PyTorch による学習（定期保存と再開、進捗の表示、同じ出力フォルダでの二重起動の防止）
-- 重みファイル `.shk` の書き出しと、書き出し後の読み直しによる確認
+- 重みファイルの書き出しと、書き出し後の読み直しによる確認（RayPair は `.shk`、HalfKP はやねうら王の `nn.bin`）
 - エンジンに渡す前の量子化の確認、エンジン用の正解データの作成
 
 ## 構成
@@ -75,6 +75,22 @@ python tools/shk_tools.py stats <PSV のパス>...
 python tools/shk_tools.py estimate-scale <PSV のパス>...
 ```
 
+### HalfKP を学習して、やねうら王・Nuenagon で使う（比較実験用）
+
+同じ学習器で、やねうら王の halfkp_256x2-32-32 と同じ HalfKP も学習できます。RayPair との比較に使います。
+
+```
+cp configs/colab_halfkp.toml my_halfkp.toml   # <…> を書き換える。network は既定で HalfKPf_256Network（因数分解つき）
+PYTHONPATH=python python -m shikibu.train --config my_halfkp.toml
+PYTHONPATH=python python -m shikibu.export --checkpoint <出力フォルダ>/checkpoint.pt --out nn.bin
+# 標準出力に「FV_SCALE=<整数>」が出る
+```
+
+- 書き出した `nn.bin` を、やねうら王・Nuenagon の評価関数ファイルとして読ませます。
+- 同じ行に出た `FV_SCALE=<整数>` を、エンジンの USI オプション `FV_SCALE` に設定してください（省略すると既定値の 16 になり、評価値の尺度が合いません）。
+- この値で、エンジンの cp は学習の値 z × eval_scale にほぼ一致します。
+- 因数分解なしの `HalfKP_256Network` も、`network` を書き換えれば選べます。`--fv-scale <整数>` で FV_SCALE を指定することもできます。
+
 ## 文書
 
 | 文書 | 内容 | 読む人 |
@@ -82,7 +98,7 @@ python tools/shk_tools.py estimate-scale <PSV のパス>...
 | [docs/GUIDE_COLAB.md](docs/GUIDE_COLAB.md) | Colab で学習を回す手順（最初から） | 学習を回す人 |
 | [docs/OPERATIONS.md](docs/OPERATIONS.md) | 運用の注意、切れたときの再開、二重起動の防止、よくあるエラー | 学習を回す人 |
 | [docs/CONFIG.md](docs/CONFIG.md) | 設定ファイル（TOML）の全キー、既定値、検査 | 学習を回す人・開発者 |
-| [docs/FORMATS.md](docs/FORMATS.md) | PSV、`.shk`、`checkpoint.pt`、`log.jsonl`、`status.json`、`train.lock` の形式 | 開発者・エンジンの開発者 |
+| [docs/FORMATS.md](docs/FORMATS.md) | PSV、`.shk`、`nn.bin`（HalfKP）、`checkpoint.pt`、`log.jsonl`、`status.json`、`train.lock` の形式 | 開発者・エンジンの開発者 |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | コードの構成と、データの流れ | 開発者 |
 | [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | 開発の進め方、変更禁止ファイル、テスト、マイルストーン、未解決の課題 | 開発者 |
 | [docs/DESIGN.md](docs/DESIGN.md) | 設計書（凍結区画の第F部を含む。変更禁止） | 全員 |

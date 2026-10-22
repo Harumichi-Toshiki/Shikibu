@@ -34,8 +34,8 @@
 
 | キー | 型 | 既定値 | 意味 | 関連 |
 |---|---|---|---|---|
-| `network` | 文字列 | `"RayPair_v0Network"` | `"RayPair_v0Network"` か `"RayPair_v1Network"`。特徴セットと層の大きさが決まる | §F3.1 |
-| `ft_width` | 整数 | `128` | 第1層の幅 W。凍結仕様は 128。**検査はしていない**。ふつうは変えない | §F3.1 |
+| `network` | 文字列 | `"RayPair_v0Network"` | `"RayPair_v0Network"` か `"RayPair_v1Network"`。比較実験用に `"HalfKP_256Network"`（版 2）と `"HalfKPf_256Network"`（版 3、因数分解つき）も選べる。特徴セットと層の大きさが決まる | §F3.1・§S11 |
+| `ft_width` | 整数 | `128` | 第1層の幅 W。凍結仕様は 128（HalfKP は 256）。**検査はしていない**。RayPair はふつう変えない | §F3.1・§S11 |
 
 - `network` に登録されていない名前は `ValueError`（登録済みの名前が表示される）。
 - `ft_width` を 128 以外にした重みは、学習はできても §F4 の凍結仕様（W = 128）から外れる。ヘッダには W が書かれるので、エンジンが対応していなければ読み込みを拒否する（§E2.3・§F4.3）。
@@ -99,7 +99,7 @@
 
 ---
 
-## ひな形（`configs/colab_v0.toml`・`configs/colab_v1.toml`）
+## ひな形（`configs/colab_v0.toml`・`configs/colab_v1.toml`・`configs/colab_halfkp.toml`）
 
 リポジトリの設定は、利用者が使うための**ひな形**です。データの場所と出力先は、`<…>` の目印で書いてあります。
 
@@ -109,7 +109,7 @@
 | `output.out_dir` | `"/content/drive/MyDrive/<出力のフォルダ>/runs/colab_v0"` | 出力フォルダ |
 | `data.val_path` | `""` | 検証用の PSV を用意したら指定する（空なら検証しない） |
 | `data.cache_dir` | `"/content/shk_cache"` | そのままでよい（Colab のローカル） |
-| `model.network` | `"RayPair_v0Network"`（v1 は `RayPair_v1Network`） | 特徴セットに合わせる |
+| `model.network` | `"RayPair_v0Network"`（v1 は `RayPair_v1Network`。`colab_halfkp.toml` は `"HalfKPf_256Network"`、`ft_width = 256`） | 特徴セットに合わせる |
 
 - 学習の値（`batch_size`・`lr`・`total_steps`・`max_steps` など）は、データに合わせて調整してよい。
 - **`<…>` の目印が残っていると、学習器は「設定のひな形のまま」と表示して、何も書かずに終了コード 1 で止まります**（`train_paths`・`train_glob`・`val_path`・`cache_dir`・`out_dir` を見る）。

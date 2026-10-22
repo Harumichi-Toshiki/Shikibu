@@ -7,6 +7,8 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 mod bench;
+mod feature;
+mod halfkp;
 mod position;
 mod psv;
 mod raypair;
@@ -19,11 +21,12 @@ fn to_py_err(msg: String) -> PyErr {
     PyValueError::new_err(msg)
 }
 
+/// 特徴の版。0 = RayPair_v0、1 = RayPair_v1、2 = HalfKP、3 = HalfKP（因数分解つき）。
 fn check_version(version: i64) -> PyResult<u8> {
     match version {
-        0 | 1 => Ok(version as u8),
+        0..=3 => Ok(version as u8),
         _ => Err(PyValueError::new_err(format!(
-            "version は 0 か 1: {version}"
+            "version は 0〜3（0・1 = RayPair、2・3 = HalfKP）: {version}"
         ))),
     }
 }
@@ -37,10 +40,10 @@ fn check_perspective(perspective: i64) -> PyResult<u8> {
     }
 }
 
-/// 特徴量の次元数。version: 0 = RayPair_v0、1 = RayPair_v1。
+/// 特徴量の次元数。version: 0 = RayPair_v0、1 = RayPair_v1、2 = HalfKP、3 = HalfKP（因数分解つき）。
 #[pyfunction]
 fn num_features(version: i64) -> PyResult<u32> {
-    raypair::num_features(check_version(version)?).map_err(to_py_err)
+    feature::num_features(check_version(version)?).map_err(to_py_err)
 }
 
 /// SFEN から特徴の多重集合（昇順・重複込み）を返す。
@@ -49,7 +52,7 @@ fn extract_sfen(sfen: &str, perspective: i64, version: i64) -> PyResult<Vec<u32>
     let persp = check_perspective(perspective)?;
     let version = check_version(version)?;
     let pos = position::parse_sfen(sfen).map_err(to_py_err)?;
-    raypair::features(&pos, persp, version).map_err(to_py_err)
+    feature::features(&pos, persp, version).map_err(to_py_err)
 }
 
 /// PSV（40バイト）を読む。戻り値は (sfen, score, move, gamePly, game_result)。
@@ -65,7 +68,7 @@ fn extract_psv(rec: &[u8], perspective: i64, version: i64) -> PyResult<Vec<u32>>
     let persp = check_perspective(perspective)?;
     let version = check_version(version)?;
     let (pos, _, _, _, _) = position::decode_psv(rec).map_err(to_py_err)?;
-    raypair::features(&pos, persp, version).map_err(to_py_err)
+    feature::features(&pos, persp, version).map_err(to_py_err)
 }
 
 /// 計測用：PSV の先頭 `n` 局面（足りなければ循環）について、解読と両視点の特徴抽出を行い、

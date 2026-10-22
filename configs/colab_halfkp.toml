@@ -1,0 +1,49 @@
+# Colab（L4）で HalfKP（やねうら王の halfkp_256x2-32-32）を学習する設定のひな形（比較実験用、§S11）。
+# 既定は因数分解つきの HalfKPf_256Network。HalfKP_256Network（因数分解なし）も、network を書き換えれば選べる。
+# 学習のあとは、shikibu.export で nn.bin を書き出す（出力に表示される FV_SCALE を、やねうら王・Nuenagon に設定する）。
+# 使うときは、このファイルをコピーして、<…> の目印を自分の環境の値に書き換える。
+#   <学習データのフォルダ>：学習用の PSV（*.psv）が置いてあるフォルダ（Google Drive 上のパス）
+#   <出力のフォルダ>：学習の出力（checkpoint.pt・log.jsonl・status.json・.shk）を置くフォルダ
+# <…> が残っていると、学習器は「設定のひな形のまま」と言って何も書かずに止まる。
+# ノートブックは、この値を設定セルの変数で置き換えて、出力フォルダに設定ファイルを書き出してから使う。
+# 学習の値（バッチ・学習率・周回数など）は、データに合わせて調整してよい。
+
+[data]
+# 学習用の PSV。周回ごとに、ファイルの順番を seed + 周回番号 で並べ替えて読む。
+train_glob = "/content/drive/MyDrive/<学習データのフォルダ>/*.psv"
+# 検証用の PSV は今の配置には無いので空（検証は行わない）。用意できたらここに指定する。
+val_path = ""
+cache_dir = "/content/shk_cache"
+max_cached = 3
+shuffle_buffer = 20000000
+num_threads = 11
+
+[model]
+network = "HalfKPf_256Network"  # HalfKP_256Network（因数分解なし）も選べる
+ft_width = 256
+
+[train]
+batch_size = 65536
+lr = 1e-3
+weight_decay = 1e-4
+warmup_steps = 1000
+total_steps = 179000
+max_steps = 179000
+min_lr_ratio = 0.01
+lam = 0.75
+eval_scale = "auto"
+scale_sample = 10000000
+allow_missing_results = false
+seed = 0
+device = "auto"
+torch_threads = 1
+deterministic = false
+save_every_steps = 0
+save_every_minutes = 30.0
+val_every_steps = 0
+val_positions = 100000
+progress_every_sec = 30.0
+log_every_steps = 100
+
+[output]
+out_dir = "/content/drive/MyDrive/<出力のフォルダ>/runs/colab_halfkp"

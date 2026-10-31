@@ -50,8 +50,9 @@ Python からは `shikibu_feat` という名前で呼びます（`Cargo.toml` �
 | `src/lib.rs` | pyo3 の入口。引数の検査と、Python に出す関数の登録 | `num_features`・`extract_sfen`・`decode_psv`・`extract_psv`・`bench_extract`・`shuffle_shards`・`BatchLoader` |
 | `src/position.rs` | 局面の表現、SFEN の読み書き、PackedSfen のデコーダ、PSV の解読。解読は8ビットの表引き（LUT） | `parse_sfen`・`to_sfen`・`decode_psfen`・`decode_psv` |
 | `src/raypair.rs` | 特徴量 RayPair（§F2）。ライン表（`LINES`）、駒の一覧（`Pieces`）、基数ソート | `num_features`・`features`・`features_from` |
-| `src/halfkp.rs` | 特徴量 HalfKP（版 2）と因数分解つき（版 3）。`tests/halfkp_ref.py` と同じ定義（§S11） | `num_features`・`features`・`features_into` |
-| `src/feature.rs` | 版の振り分け。0・1 は RayPair、2・3 は HalfKP | `num_features`・`features`・`side_features` |
+| `src/halfk.rs` | 特徴量 HalfKP（版 2・3）、HalfKA1・HalfKA2・HalfKA_hm1・HalfKA_hm2（版 4〜11、奇数は因数分解つき）。`tests/nnue_ref.py` と同じ定義（§S11・§S12） | `num_features`・`features_into` |
+| `src/kingzone.rs` | 玉の周りのブロック（区間 C、版 12・13 で RayPair に付け足す）。`tests/kingzone_ref.py` と同じ定義（§S12.3） | `DIM`・`features_into` |
+| `src/feature.rs` | 版の振り分け。0・1 は RayPair、2〜11 は HalfK 系、12・13 は RayPair ＋ 玉の周り。玉のマス（`king_squares`）も | `num_features`・`features`・`side_features`・`king_squares` |
 | `src/psv.rs` | PSV レコードの読み取りの共通部品 | `score`・`ply`・`result`・`read_full`・`checked_size`・`for_each_record` |
 | `src/loader.rs` | 学習用のバッチを作る `BatchLoader`（読み係・作業係・コピー係・再開） | `BatchLoader`（`__next__`・`state`・`cache_stats`） |
 | `src/shuffle.rs` | 事前シャッフルとシャード分割（2パス方式） | `shuffle_shards` |
@@ -69,10 +70,11 @@ Python からは `shikibu_feat` という名前で呼びます（`Cargo.toml` �
 | ファイル | 役割 |
 |---|---|
 | `lock.py` | 二重起動の防止（`train.lock`）。ロックの取得・心拍（10 秒ごと）・解放。古いロックの判定と、`--force-unlock` による引き継ぎ（M5.1） |
-| `networks.py` | ネットワークの定義（`RayPairNetwork`・`RayPair_v0Network`・`RayPair_v1Network`、比較実験用の `HalfKP_256Network`・`HalfKPf_256Network`）。`NETWORKS` に名前で登録し、`build(name)` で作る。重みの名前は §F4.2 と同じ |
+| `networks.py` | ネットワークの定義。従来の名前（`RayPair_v0Network`・`HalfKPf_256Network` など）は `NETWORKS` に登録したクラス。構造の名前は `parse_arch` で読み、`ArchNetwork` で作る（psqt・k3k3 を含む）。`arch_of` は従来の名前を正規の形にする。重みの名前は §F4.2 と同じ（k3k3 は層の組を 9 個並べる） |
 | `train.py` | 学習ループ。設定の読み込み・検査（`load_config`・`validate`）、勝敗欠損の確認と eval_scale の決定、損失・オプティマイザ・学習率・重みのクリップ、保存と再開、ログ（`Status`・`JsonlLog`） |
-| `export.py` | `checkpoint.pt` → `.shk`（§F4）、HalfKP なら `nn.bin`（§S11、`export_nnbin`）。書き出しのあとで読み直して確かめる。`read_shk` もここ |
-| `nnbin.py` | やねうら王の nn.bin（halfkp_256x2-32-32）の並び・ハッシュ・構造の文字列。`write`・`read` |
+| `export.py` | `checkpoint.pt` → `.shk`（§F4、raypair0・1 の任意の幅）、`nn.bin`（§S11・§S12、halfk… の任意の幅、`export_nnbin`）。書けないものは `ValueError`。書き出しのあとで読み直して確かめる。`read_shk` もここ |
+| `nnbin.py` | やねうら王の nn.bin の並び・ハッシュ・構造の文字列（特徴と幅・層を引数に取る）。`write`・`read`・`file_size` |
+| `lab.py` | 評価関数の構造の実験室（§S12）。`PRESETS`・`describe`・`make_config`・`write_config`・`compare_runs`（val_loss の比較）・`export_run` |
 | `quantsim.py` | §E4 の量子化を Python で再現する確認用ツール（凍結区画ではない） |
 | `__init__.py` | パッケージの説明だけ |
 

@@ -33,8 +33,7 @@ os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 LIMIT = 127.0 / 64.0  # §F3.3 の Linear の重みの範囲
 PSV_BYTES = 40
 SCALE_BLOCK = 10_000  # eval_scale の推定に使う局面を取り出す連続ブロックの長さ（局面数）
-DECAY_PARAMS = ("l1.weight", "l2.weight", "out.weight")  # weight decay の対象（§S6）
-BATCH_KEYS = ("stm_indices", "stm_offsets", "nstm_indices", "nstm_offsets", "score", "result")
+BATCH_KEYS = ("stm_indices", "stm_offsets", "nstm_indices", "nstm_offsets", "score", "result", "kings")
 
 DEFAULTS = {
     "data": {
@@ -46,7 +45,7 @@ DEFAULTS = {
         "shuffle_buffer": 0,
         "num_threads": 1,
     },
-    "model": {"network": "RayPair_v0Network", "ft_width": 128},
+    "model": {"network": "RayPair_v0Network", "ft_width": 0},  # ft_width 0 = 名前に合わせる（従来の名前なら 128）
     "train": {
         "batch_size": 16384,
         "lr": 1e-3,
@@ -131,10 +130,22 @@ def validate(cfg):
     if d["val_path"] and t["val_positions"] <= 0:
         raise ValueError("val_positions は1以上")
     eval_scale_setting(t["eval_scale"])
+    network_name(cfg["model"])
     _check_min(t, "log_every_steps", 1)
     _check_min(t, "save_every_steps", 0)  # 0 は無効
     _check_min(t, "val_every_steps", 0)   # 0 は無効
     _check_min(t, "progress_every_sec", 0.0)
+
+
+def network_name(m):
+    """model.network を確かめ、checkpoint に書く名前を返す（従来の名前はそのまま、構造の名前は正規の形）。"""
+    name = m["network"]
+    if name in networks.NETWORKS:
+        return name
+    p = networks.parse_arch(name)
+    if m.get("ft_width", 0) not in (0, p["W"]):
+        raise ValueError(f"model.ft_width（{m['ft_width']}）が構造の名前の W（{p['W']}）と違う: {name}")
+    return p["canonical"]
 
 
 def eval_scale_setting(v):
@@ -158,6 +169,10 @@ def train_paths(d):
         paths = sorted(glob.glob(d["train_glob"]))
     else:
         paths = list(d["train_paths"])
+    if d.get("val_path"):
+        # 検証のファイルは学習に使わない（§S12.5）
+        val = os.path.realpath(d["val_path"])
+        paths = [x for x in paths if os.path.realpath(x) != val]
     if not paths:
         raise ValueError("学習データが1つも無い（data.train_paths / data.train_glob）")
     return paths
@@ -229,11 +244,8 @@ def restore_rng(st):
 
 @torch.no_grad()
 def clip_weights_(model):
-    """§F3.3：各ステップの後に範囲へ収める。bias は対象外。"""
-    model.ft.weight.clamp_(-1.0, 1.0)
-    model.ft_bias.clamp_(-1.0, 1.0)
-    for lin in (model.l1, model.l2, model.out):
-        lin.weight.clamp_(-LIMIT, LIMIT)
+    """§F3.3：各ステップの後に範囲へ収める。bias・psqt は対象外。"""
+    model.clip_(LIMIT)
 
 
 def compute_loss(z, score, result, eval_scale, lam):
@@ -243,9 +255,9 @@ def compute_loss(z, score, result, eval_scale, lam):
 
 
 def build_optimizer(model, lr, weight_decay):
-    named = dict(model.named_parameters())
-    decay = [named[k] for k in DECAY_PARAMS]
-    no_decay = [p for k, p in named.items() if k not in DECAY_PARAMS]
+    decay = model.decay_parameters()
+    ids = {id(p) for p in decay}
+    no_decay = [p for p in model.parameters() if id(p) not in ids]
     return torch.optim.AdamW(
         [
             {"params": decay, "weight_decay": weight_decay},
@@ -282,7 +294,7 @@ def to_device(batch, device):
 def evaluate(model, val, eval_scale, lam):
     """検証：(val_loss, val_mse)。val_mse = mean((sigmoid(z) − sigmoid(score / eval_scale))²)。"""
     model.eval()
-    z = model(val["stm_indices"], val["stm_offsets"], val["nstm_indices"], val["nstm_offsets"])
+    z = model(val["stm_indices"], val["stm_offsets"], val["nstm_indices"], val["nstm_offsets"], kings=val["kings"])
     loss = compute_loss(z, val["score"], val["result"], eval_scale, lam)
     target = torch.sigmoid(val["score"] / eval_scale)
     mse = ((torch.sigmoid(z) - target) ** 2).mean()
@@ -354,6 +366,7 @@ class Trainer:
         self.lam = float(t["lam"])
         self.paths = train_paths(d)
         self.saved_step = -1
+        self.network = network_name(m)
         self.scale_used = None  # 勝敗の確認と推定に使った局面数（新規の学習でだけ決まる）
 
         ck = None
@@ -361,7 +374,7 @@ class Trainer:
             if not resume:
                 raise FileExistsError(f"{self.ckpt_path} がある。続けるなら --resume を付ける（上書きはしない）")
             ck = torch.load(self.ckpt_path, map_location="cpu", weights_only=False)
-            if ck["network"] != m["network"] or ck["lam"] != self.lam:
+            if ck["network"] != self.network or ck["lam"] != self.lam:
                 raise ValueError("checkpoint の network / lam が設定と違う")
         elif resume:
             print("checkpoint.pt が無いので最初から学習します", file=sys.stderr)
@@ -369,7 +382,7 @@ class Trainer:
         self.device = pick_device(t["device"])
         configure_runtime(t)
         seed_everything(t["seed"])
-        self.model = networks.build(m["network"], ft_width=m["ft_width"])
+        self.model = networks.build(self.network, ft_width=m["ft_width"] or 128)
         self.version = self.model.FEATURE_VERSION
         if shikibu_feat.num_features(self.version) != self.model.NUM_FEATURES:
             raise RuntimeError("ネットワークの特徴数が shikibu_feat と一致しない")
@@ -486,7 +499,7 @@ class Trainer:
             "eval_scale": self.eval_scale,
             "eval_scale_source": self.eval_scale_source,
             "lam": self.lam,
-            "network": self.cfg["model"]["network"],
+            "network": self.network,
             "config": self.cfg,
             "rng": rng_state(),
             "file_perm": self.perm,
@@ -501,7 +514,7 @@ class Trainer:
 
     def _train_step(self, batch):
         x = to_device(batch, self.device)
-        z = self.model(x["stm_indices"], x["stm_offsets"], x["nstm_indices"], x["nstm_offsets"])
+        z = self.model(x["stm_indices"], x["stm_offsets"], x["nstm_indices"], x["nstm_offsets"], kings=x["kings"])
         loss = compute_loss(z, x["score"], x["result"], self.eval_scale, self.lam)
         lr = self.t["lr"] * lr_factor(self.step, self.t["warmup_steps"], self.t["total_steps"],
                                       self.t["min_lr_ratio"])
@@ -520,7 +533,7 @@ class Trainer:
         self.log.write({
             "type": "start", "step": self.step, "epoch": self.epoch, "resumed": self.step > 0,
             "eval_scale": self.eval_scale, "eval_scale_source": self.eval_scale_source,
-            "lam": self.lam, "network": self.cfg["model"]["network"], "device": str(self.device),
+            "lam": self.lam, "network": self.network, "device": str(self.device),
             "n_files": len(self.paths), "scale_positions_used": self.scale_used, "config": self.cfg,
         })
 

@@ -8,7 +8,8 @@ use pyo3::types::PyDict;
 
 mod bench;
 mod feature;
-mod halfkp;
+mod halfk;
+mod kingzone;
 mod position;
 mod psv;
 mod raypair;
@@ -21,12 +22,12 @@ fn to_py_err(msg: String) -> PyErr {
     PyValueError::new_err(msg)
 }
 
-/// 特徴の版。0 = RayPair_v0、1 = RayPair_v1、2 = HalfKP、3 = HalfKP（因数分解つき）。
+/// 特徴の版（一覧は shikibu.networks.FEATURES と docs/FORMATS.md）。
 fn check_version(version: i64) -> PyResult<u8> {
     match version {
-        0..=3 => Ok(version as u8),
+        0..=13 => Ok(version as u8),
         _ => Err(PyValueError::new_err(format!(
-            "version は 0〜3（0・1 = RayPair、2・3 = HalfKP）: {version}"
+            "version は 0〜13（0・1 = RayPair、2〜11 = HalfK 系、12・13 = RayPair ＋ 玉の周り）: {version}"
         ))),
     }
 }
@@ -40,7 +41,7 @@ fn check_perspective(perspective: i64) -> PyResult<u8> {
     }
 }
 
-/// 特徴量の次元数。version: 0 = RayPair_v0、1 = RayPair_v1、2 = HalfKP、3 = HalfKP（因数分解つき）。
+/// 特徴量の次元数（version は check_version と同じ）。
 #[pyfunction]
 fn num_features(version: i64) -> PyResult<u32> {
     feature::num_features(check_version(version)?).map_err(to_py_err)
@@ -53,6 +54,13 @@ fn extract_sfen(sfen: &str, perspective: i64, version: i64) -> PyResult<Vec<u32>
     let version = check_version(version)?;
     let pos = position::parse_sfen(sfen).map_err(to_py_err)?;
     feature::features(&pos, persp, version).map_err(to_py_err)
+}
+
+/// 玉のマス（RayPair の視点座標 `y × 9 + x`）。戻り値は (手番側の玉, 相手の玉)。
+#[pyfunction]
+fn king_squares_sfen(sfen: &str) -> PyResult<(u32, u32)> {
+    let pos = position::parse_sfen(sfen).map_err(to_py_err)?;
+    feature::king_squares(&pos).map_err(to_py_err)
 }
 
 /// PSV（40バイト）を読む。戻り値は (sfen, score, move, gamePly, game_result)。
@@ -118,6 +126,7 @@ fn shikibu_feat(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(num_features, m)?)?;
     m.add_function(wrap_pyfunction!(extract_sfen, m)?)?;
     m.add_function(wrap_pyfunction!(decode_psv, m)?)?;
+    m.add_function(wrap_pyfunction!(king_squares_sfen, m)?)?;
     m.add_function(wrap_pyfunction!(extract_psv, m)?)?;
     m.add_function(wrap_pyfunction!(bench_extract, m)?)?;
     m.add_function(wrap_pyfunction!(stats::psv_stats, m)?)?;

@@ -4,12 +4,14 @@
     !python /content/drive/MyDrive/<置き場所>/shk_speedcheck.py --repo <REPO> --glob "<学習データ>/*.psv" \
         --network halfkp_256x2-32-32_f --batch 65536 --threads 11
 
-測るもの:
+測るもの（M8 の新しい 1 ステップ＝学習と同じ処理で測る）:
   A. 読み込みだけ（Rust の BatchLoader）：毎秒何局面を用意できるか
-  B. GPU への転送だけ（to_device）
-  C. GPU の計算だけ（同じバッチを繰り返し。前向き＋逆伝播＋AdamW＋クリップ）
-     C1 今のまま / C2 fused AdamW / C3 第1層を「局面数 × 特徴数」の表で計算（特徴の数が一定の構造だけ）
-  D. 全部込み（今の学習と同じ流れ）
+  B. GPU への転送だけ（train.Prefetcher：固定メモリ＋転送のストリーム）
+  C. GPU の計算だけ（同じバッチを繰り返し。前向き（base=True）＋逆伝播＋AdamW＋クリップ）
+     C1 AdamW（fused を使わない）/ C2 fused AdamW（CUDA のときだけ。学習の既定）
+  D. 全部込み（学習と同じ流れ：次のバッチの読み込みと転送を、今のステップの計算と重ねる）
+
+注意：CPU では C2 と D の転送は従来どおり（fused と非同期転送は CUDA だけ）。速さは CUDA で測ること。
 """
 import argparse
 import glob
@@ -30,23 +32,34 @@ def main():
     sys.path.insert(0, os.path.join(args.repo, "python"))
 
     import torch
-    import torch.nn.functional as F
     import shikibu_feat
     from shikibu import networks, train
 
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("device:", dev, torch.cuda.get_device_name(0) if dev.type == "cuda" else "")
+    fused = dev.type == "cuda"
+    print("device:", dev, torch.cuda.get_device_name(0) if fused else "")
     paths = sorted(glob.glob(args.glob))[:4]
-    model = networks.build(args.network).to(dev)
-    ver = model.FEATURE_VERSION
     B = args.batch
+    ver = networks.build(args.network).INPUT_VERSION  # 学習と同じ：ローダーは因数分解なしの版
 
     def sync():
-        if dev.type == "cuda":
+        if fused:
             torch.cuda.synchronize()
 
     def loader():
         return shikibu_feat.BatchLoader(paths, B, ver, shuffle_buffer=0, seed=0, num_threads=args.threads)
+
+    def new_model():
+        return networks.build(args.network).to(dev)
+
+    def step(m, opt, x):
+        """学習の 1 ステップ（Trainer._train_step と同じ計算）。"""
+        z = m(x["stm_indices"], x["stm_offsets"], x["nstm_indices"], x["nstm_offsets"], kings=x["kings"], base=True)
+        loss = train.compute_loss(z, x["score"], x["result"], 600.0, 0.75)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        train.clip_weights_(m)
 
     # A. 読み込みだけ
     it = loader()
@@ -62,81 +75,51 @@ def main():
     print(f"A 読み込みだけ        : {n / ta / 1e4:8.1f} 万局面/秒")
     del it
 
-    # B. 転送だけ
+    # B. 転送だけ（学習と同じ Prefetcher）
+    pf = train.Prefetcher(dev)
     sync(); t = time.perf_counter()
     for i in range(args.steps):
-        x = train.to_device(batches[i % 3], dev)
+        x, ev = pf.send(batches[i % 3])
+        pf.ready(x, ev)
     sync(); tb = time.perf_counter() - t
     print(f"B 転送だけ            : {args.steps * B / tb / 1e4:8.1f} 万局面/秒")
 
-    x = train.to_device(batches[0], dev)
+    x0, ev0 = pf.send(batches[0])
+    x0 = pf.ready(x0, ev0)
 
-    def step_loop(m, opt, fwd, label):
+    def timed(label, m, opt):
         for _ in range(3):  # ウォームアップ
-            z = fwd(m, x)
-            loss = train.compute_loss(z, x["score"], x["result"], 600.0, 0.75)
-            opt.zero_grad(set_to_none=True); loss.backward(); opt.step(); train.clip_weights_(m)
+            step(m, opt, x0)
         sync(); t = time.perf_counter()
         for _ in range(args.steps):
-            z = fwd(m, x)
-            loss = train.compute_loss(z, x["score"], x["result"], 600.0, 0.75)
-            opt.zero_grad(set_to_none=True); loss.backward(); opt.step(); train.clip_weights_(m)
+            step(m, opt, x0)
         sync(); tc = time.perf_counter() - t
-        print(f"{label:22s}: {args.steps * B / tc / 1e4:8.1f} 万局面/秒  ({tc / args.steps * 1000:.1f} ms/step)")
+        print(f"{label:24s}: {args.steps * B / tc / 1e4:8.1f} 万局面/秒  ({tc / args.steps * 1000:.1f} ms/step)")
 
-    def fwd_bag(m, x):
-        return m(x["stm_indices"], x["stm_offsets"], x["nstm_indices"], x["nstm_offsets"], kings=x["kings"])
+    # C1 fused を使わない / C2 学習の既定（CUDA なら fused）
+    m1 = new_model()
+    timed("C1 GPUの計算（fusedなし）", m1, train.build_optimizer(m1, 1e-3, 1e-4, fused=False))
+    m2 = new_model()
+    timed("C2 GPUの計算（学習の既定）", m2, train.build_optimizer(m2, 1e-3, 1e-4, fused=fused))
 
-    # C1 今のまま
-    opt = train.build_optimizer(model, 1e-3, 1e-4)
-    step_loop(model, opt, fwd_bag, "C1 GPUの計算（今）")
-
-    # C2 fused AdamW
-    if dev.type == "cuda":
-        try:
-            m2 = networks.build(args.network).to(dev)
-            decay = m2.decay_parameters(); ids = {id(p) for p in decay}
-            opt2 = torch.optim.AdamW([{"params": decay, "weight_decay": 1e-4},
-                                      {"params": [p for p in m2.parameters() if id(p) not in ids], "weight_decay": 0.0}],
-                                     lr=1e-3, fused=True)
-            step_loop(m2, opt2, fwd_bag, "C2 fused AdamW")
-        except Exception as e:
-            print("C2 fused AdamW         : 失敗", e)
-
-    # C3 第1層を表で計算（特徴の数が全局面で同じときだけ）
-    so, si = x["stm_offsets"], x["stm_indices"]
-    k = si.numel() // so.numel()
-    same = (k * so.numel() == si.numel()) and bool((so == torch.arange(so.numel(), device=dev) * k).all())
-    if same and model.STACKS == 1 and not model.PSQT:
-        sidx = si.view(-1, k).int(); nidx = x["nstm_indices"].view(-1, k).int()
-
-        def fwd_tab(m, x):
-            w = m.ft.weight
-            a = F.embedding(sidx, w).sum(1) + m.ft_bias
-            b = F.embedding(nidx, w).sum(1) + m.ft_bias
-            h = torch.clamp(torch.cat([a, b], 1), 0, 1)
-            h = torch.clamp(m.l1(h), 0, 1)
-            h = torch.clamp(m.l2(h), 0, 1)
-            return m.out(h).squeeze(1)
-        m3 = networks.build(args.network).to(dev)
-        step_loop(m3, train.build_optimizer(m3, 1e-3, 1e-4), fwd_tab, f"C3 表で計算（{k}個）")
-    else:
-        print("C3 表で計算           : この構造は特徴の数が一定でないので省略")
-
-    # D. 全部込み
+    # D. 全部込み：学習の run() と同じ流れ（次のバッチを、今のステップの計算より前に読んで送る）
+    m3 = new_model()
+    opt3 = train.build_optimizer(m3, 1e-3, 1e-4, fused=fused)
     it = loader()
     for _ in range(3):
         next(it)
+
+    def fetch():
+        return pf.send(next(it))
+
+    pend = fetch()
     sync(); t = time.perf_counter(); n = 0
     for _ in range(args.steps):
-        b = next(it, None)
-        if b is None:
-            break
-        xx = train.to_device(b, dev)
-        z = fwd_bag(model, xx)
-        loss = train.compute_loss(z, xx["score"], xx["result"], 600.0, 0.75)
-        opt.zero_grad(set_to_none=True); loss.backward(); opt.step(); train.clip_weights_(model)
-        n += len(b["score"])
+        cur, pend = pend, fetch()
+        x, ev = cur
+        x = pf.ready(x, ev)
+        step(m3, opt3, x)
+        n += int(x["score"].shape[0])
     sync(); td = time.perf_counter() - t
     print(f"D 全部込み            : {n / td / 1e4:8.1f} 万局面/秒")
 

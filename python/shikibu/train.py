@@ -294,7 +294,7 @@ def to_device(batch, device):
 def evaluate(model, val, eval_scale, lam):
     """検証：(val_loss, val_mse)。val_mse = mean((sigmoid(z) − sigmoid(score / eval_scale))²)。"""
     model.eval()
-    z = model(val["stm_indices"], val["stm_offsets"], val["nstm_indices"], val["nstm_offsets"], kings=val["kings"])
+    z = model(val["stm_indices"], val["stm_offsets"], val["nstm_indices"], val["nstm_offsets"], kings=val["kings"], base=True)
     loss = compute_loss(z, val["score"], val["result"], eval_scale, lam)
     target = torch.sigmoid(val["score"] / eval_scale)
     mse = ((torch.sigmoid(z) - target) ** 2).mean()
@@ -383,8 +383,8 @@ class Trainer:
         configure_runtime(t)
         seed_everything(t["seed"])
         self.model = networks.build(self.network, ft_width=m["ft_width"] or 128)
-        self.version = self.model.FEATURE_VERSION
-        if shikibu_feat.num_features(self.version) != self.model.NUM_FEATURES:
+        self.version = self.model.INPUT_VERSION  # 因数分解つきでも、ローダーは因数分解なしの版（M8）
+        if shikibu_feat.num_features(self.model.FEATURE_VERSION) != self.model.NUM_FEATURES:
             raise RuntimeError("ネットワークの特徴数が shikibu_feat と一致しない")
         self.model.to(self.device)
         self.optimizer = build_optimizer(self.model, t["lr"], t["weight_decay"])
@@ -514,7 +514,7 @@ class Trainer:
 
     def _train_step(self, batch):
         x = to_device(batch, self.device)
-        z = self.model(x["stm_indices"], x["stm_offsets"], x["nstm_indices"], x["nstm_offsets"], kings=x["kings"])
+        z = self.model(x["stm_indices"], x["stm_offsets"], x["nstm_indices"], x["nstm_offsets"], kings=x["kings"], base=True)
         loss = compute_loss(z, x["score"], x["result"], self.eval_scale, self.lam)
         lr = self.t["lr"] * lr_factor(self.step, self.t["warmup_steps"], self.t["total_steps"],
                                       self.t["min_lr_ratio"])

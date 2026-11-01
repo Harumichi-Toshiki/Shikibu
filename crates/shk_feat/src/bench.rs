@@ -26,7 +26,7 @@ pub fn bench_extract(paths: &[String], n: usize, version: u8, num_threads: usize
                 s.spawn(move || -> Result<u64, String> {
                     let mut check = 0u64;
                     for batch in part.chunks(CHUNK * REC) {
-                        let f = features_of(batch, version)?;
+                        let (f, _) = features_of(batch, version)?;
                         check = check
                             .wrapping_add(f.stm_idx.iter().map(|&i| i as u64).sum::<u64>())
                             .wrapping_add(f.nstm_idx.iter().map(|&i| i as u64).sum::<u64>());

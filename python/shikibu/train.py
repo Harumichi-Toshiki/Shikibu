@@ -473,6 +473,11 @@ class Trainer:
         self.cache_seen = 0
         if d["cache_dir"]:
             self.status.enter("prefetch", self.log)
+        # 壊れたレコードの数（M8.1）。学習済みの位置までの合計を checkpoint に書く。再開したら、その値から続ける。
+        self.bad_base = int(ck["bad_records"]) if ck is not None and "bad_records" in ck else 0
+        self.bad_closed = 0      # 閉じたローダーで飛ばした数（周回をまたいで足す）
+        self.bad_records = self.bad_base
+        self.bad_announced = False
         self._open_loader(loader_state, self.epoch, self.perm)
         # 学習済みの位置（checkpoint に書く）。先読みの位置（rd_*）とは分けて持つ（M8）
         self.loader_state = dict(self.loader.state())
@@ -511,13 +516,18 @@ class Trainer:
         loader = shikibu_feat.BatchLoader([self.d["val_path"]], self.t["val_positions"], self.version,
                                           0, 0, self.d["num_threads"])
         batch = next(loader, None)
+        n_bad = loader.skipped()
         del loader
+        if n_bad > 0:
+            print(f"検証データで壊れたレコードを飛ばしました（{n_bad} 件）", flush=True)
         if batch is None:
             raise RuntimeError("検証データが空")
         return to_device(batch, self.device)
 
     def _open_loader(self, state, epoch, perm):
         d, t = self.d, self.t
+        if self.loader is not None:
+            self.bad_closed += self.loader.skipped()  # 閉じるローダーで飛ばした数を残す（M8.1）
         self.loader = None  # 前のローダーを止めてからでないと、キャッシュ先を作り直せない
         self.cache_seen = 0
         self.rd_epoch, self.rd_perm = epoch, perm  # ローダーが今いる周回と順番（先読みの位置）
@@ -539,7 +549,12 @@ class Trainer:
             batch = next(self.loader, None)
             if batch is None:
                 raise RuntimeError("局面が1つも読めなかった")
-        meta = {"epoch": self.rd_epoch, "perm": self.rd_perm, "loader_state": dict(self.loader.state())}
+        bad = self.bad_base + self.bad_closed + self.loader.skipped()
+        if bad > 0 and not self.bad_announced:
+            print(f"壊れたレコードを飛ばしました（ここまでに {bad} 件）。学習は続けます", flush=True)
+            self.bad_announced = True
+        meta = {"epoch": self.rd_epoch, "perm": self.rd_perm, "loader_state": dict(self.loader.state()),
+                "bad": bad}
         x, ev = self.prefetch.send(batch)
         return x, ev, meta
 
@@ -566,6 +581,7 @@ class Trainer:
             "config": self.cfg,
             "rng": rng_state(),
             "file_perm": self.perm,
+            "bad_records": self.bad_records,
         }
         tmp = self.ckpt_path + ".tmp"
         torch.save(state, tmp)
@@ -589,6 +605,7 @@ class Trainer:
         clip_weights_(self.model)
         # このバッチまで学習した。checkpoint に書く位置を、このバッチの位置に進める
         self.epoch, self.perm, self.loader_state = meta["epoch"], meta["perm"], meta["loader_state"]
+        self.bad_records = meta["bad"]
         self.step += 1
         self.pos_since_log += int(x["score"].shape[0])
         self.pos_since_print += int(x["score"].shape[0])
@@ -649,7 +666,7 @@ class Trainer:
             if self.step % t["log_every_steps"] == 0:
                 self.log.write({
                     "type": "train", "step": self.step, "epoch": self.epoch,
-                    "loss": float(loss.item()), "lr": lr,
+                    "loss": float(loss.item()), "lr": lr, "bad_records": self.bad_records,
                     "progress": self.step / t["max_steps"], "eta_sec": self._eta(now),
                     "positions_per_sec": self.pos_since_log / max(now - self.last_log, 1e-9),
                     "elapsed_sec": now - self.t0,

@@ -71,6 +71,8 @@ struct Done {
     cursor: Cursor,
     /// `Ok(None)` は終わり。
     body: Result<Option<Features>, String>,
+    /// このバッチで飛ばしたレコードの数（M8.1）
+    skipped: u64,
 }
 
 /// 1バッチぶんの出力（nn.EmbeddingBag の形式、§S3.3）。
@@ -85,7 +87,15 @@ pub(crate) struct Features {
     kings: Vec<i64>,
 }
 
-pub(crate) fn features_of(raw: &[u8], version: u8) -> Result<Features, String> {
+impl Features {
+    /// 局面が 1 つも無い（このバッチの全部を飛ばした）。
+    fn is_empty(&self) -> bool {
+        self.score.is_empty()
+    }
+}
+
+/// 1 バッチの特徴。読み解けないレコードと game_result が −1〜1 の外のレコードは飛ばし、飛ばした数を返す（M8.1）。
+pub(crate) fn features_of(raw: &[u8], version: u8) -> Result<(Features, u64), String> {
     let n = raw.len() / REC;
     // 1局面あたり両視点で約 130 個（盤上の駒と持ち駒、隣接する駒の対）
     let mut f = Features {
@@ -98,10 +108,18 @@ pub(crate) fn features_of(raw: &[u8], version: u8) -> Result<Features, String> {
         kings: Vec::with_capacity(2 * n),
     };
     let mut buf: Vec<u32> = Vec::with_capacity(FEATS_PER_POS);
+    let mut skipped = 0u64;
     for rec in raw.chunks_exact(REC) {
-        let (pos, score, _, _, result) = position::decode_psv(rec)?;
+        let (pos, score, _, _, result) = match position::decode_psv(rec) {
+            Ok(v) => v,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
         if !(-1..=1).contains(&result) {
-            return Err(format!("game_result が −1〜1 の外: {result}"));
+            skipped += 1;
+            continue;
         }
         let stm = pos.stm;
         let nstm = 1 - stm;
@@ -119,7 +137,7 @@ pub(crate) fn features_of(raw: &[u8], version: u8) -> Result<Features, String> {
         f.kings.push(king_stm as i64);
         f.kings.push(king_nstm as i64);
     }
-    Ok(f)
+    Ok((f, skipped))
 }
 
 // ---------- コピー係（cache_dir への先読み） ----------
@@ -438,16 +456,20 @@ fn work_loop(version: u8, rx: Arc<Mutex<Receiver<Work>>>, done: Sender<Done>) {
             Ok(w) => w,
             Err(_) => return,
         };
-        let body = match w.raw {
-            Ok(Some(raw)) => features_of(&raw, version).map(Some),
-            Ok(None) => Ok(None),
-            Err(msg) => Err(msg),
+        let (body, skipped) = match w.raw {
+            Ok(Some(raw)) => match features_of(&raw, version) {
+                Ok((f, skipped)) => (Ok(Some(f)), skipped),
+                Err(msg) => (Err(msg), 0),
+            },
+            Ok(None) => (Ok(None), 0),
+            Err(msg) => (Err(msg), 0),
         };
         if done
             .send(Done {
                 seq: w.seq,
                 cursor: w.cursor,
                 body,
+                skipped,
             })
             .is_err()
         {
@@ -513,6 +535,8 @@ pub struct BatchLoader {
     finished: bool,
     cache: Option<Arc<CacheHub>>,
     threads: Vec<JoinHandle<()>>,
+    /// このローダーで飛ばしたレコードの数（M8.1）
+    n_skipped: u64,
 }
 
 #[pymethods]
@@ -608,6 +632,7 @@ impl BatchLoader {
             finished: false,
             cache,
             threads,
+            n_skipped: 0,
         })
     }
 
@@ -636,41 +661,53 @@ impl BatchLoader {
         if self.finished {
             return Ok(None);
         }
-        // 番号の順に取り出す（作業係の終わる順は問わない）
-        let done = loop {
-            if let Some(d) = self.pending.remove(&self.next_seq) {
-                break d;
-            }
-            let rx = &self.result_rx;
-            match py.allow_threads(|| lock(rx).recv()) {
-                Ok(d) => {
-                    self.pending.insert(d.seq, d);
+        loop {
+            // 番号の順に取り出す（作業係の終わる順は問わない）
+            let done = loop {
+                if let Some(d) = self.pending.remove(&self.next_seq) {
+                    break d;
                 }
-                Err(_) => {
+                let rx = &self.result_rx;
+                match py.allow_threads(|| lock(rx).recv()) {
+                    Ok(d) => {
+                        self.pending.insert(d.seq, d);
+                    }
+                    Err(_) => {
+                        self.finished = true;
+                        return Err(PyRuntimeError::new_err("ローダーの作業が途中で止まった"));
+                    }
+                }
+            };
+            self.next_seq += 1;
+            match done.body {
+                Err(msg) => {
                     self.finished = true;
-                    return Err(PyRuntimeError::new_err("ローダーの作業が途中で止まった"));
+                    return Err(PyRuntimeError::new_err(msg));
                 }
-            }
-        };
-        self.next_seq += 1;
-        match done.body {
-            Err(msg) => {
-                self.finished = true;
-                Err(PyRuntimeError::new_err(msg))
-            }
-            Ok(None) => {
-                self.cursor = done.cursor;
-                self.finished = true;
-                Ok(None)
-            }
-            Ok(Some(f)) => {
-                self.cursor = done.cursor;
-                if let Some(tx) = &self.credit_tx {
-                    let _ = tx.send(());
+                Ok(None) => {
+                    self.cursor = done.cursor;
+                    self.finished = true;
+                    return Ok(None);
                 }
-                Ok(Some(to_dict(py, f)?))
+                Ok(Some(f)) => {
+                    self.cursor = done.cursor;
+                    self.n_skipped += done.skipped;
+                    if let Some(tx) = &self.credit_tx {
+                        let _ = tx.send(());
+                    }
+                    // 全部を飛ばしたバッチは返さず、次のバッチへ進む（枠は返してある）
+                    if f.is_empty() {
+                        continue;
+                    }
+                    return Ok(Some(to_dict(py, f)?));
+                }
             }
         }
+    }
+
+    /// このローダーで読み解けずに飛ばしたレコードの数（作ってからの合計、M8.1）。
+    fn skipped(&self) -> u64 {
+        self.n_skipped
     }
 
     /// 直前に返したバッチの直後の位置。JSON にできる dict で、`resume_state` に渡せる。

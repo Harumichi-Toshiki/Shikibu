@@ -123,6 +123,7 @@ python perf/perf_check.py --profile colab                        # Colab 本番�
 | **M5.1** 汎用化と不具合の修正 | 特定の利用者・データへの依存を取り除く（設定はひな形、ノートブックは設定セル）。ロック（`train.lock`）、設定の検査、`shk_tools shuffle` の表示、`.gitignore` | 88 件通過（M1〜M4 の 73 件と、M5.1 の 15 件）。`REPORT_M51.md` |
 | **M6** HalfKP の学習（比較実験用） | HalfKP（版 2）と因数分解つき（版 3）の特徴、`HalfKP_256Network`・`HalfKPf_256Network`、やねうら王の `nn.bin` の書き出し（`FV_SCALE` の表示）、HalfKP のひな形とノートブック | 100 件通過（M1〜M5.1 の 88 件と、M6 の 12 件）。`REPORT_M6.md` |
 | **M7** 評価関数の構造の実験室 | 構造の名前（`<特徴>_<W>x2-<L1>-<L2>[_f][_psqt][_k3k3]`）で、特徴（版 0〜13）・幅・層・オプションを切り替えて学習。`nn.bin`（halfk… の任意の幅）と `.shk`（raypair0・1 の任意の幅）の書き出し、`shikibu.lab`、実験室のノートブック | 142 件通過（M1〜M6 の 100 件と、M7 の 42 件）。`REPORT_M7.md` |
+| **M8** 学習の高速化 | 因数分解を重みの側で行う（`INPUT_VERSION`、`forward(base=True)` で、W_eff を forward ごとに 1 回作る）。次のバッチの読み込みと転送を、今のステップの計算と重ねる（CUDA は固定メモリ 2 面と転送のストリーム、CPU は従来どおり）。CUDA で fused AdamW。`tools/shk_speedcheck.py` を学習の 1 ステップで測る形に直した。checkpoint の形・書き出し・数学は変えていない | 151 件通過（M1〜M7 の 142 件と、M8 の 9 件）。`REPORT_M8.md`。CUDA の速さは未計測（持ち主が Colab で測る） |
 
 ### 4.1 各マイルストーンで決まったこと（要点）
 

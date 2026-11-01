@@ -62,6 +62,31 @@ def parse_arch(name):
             "version": v1 if factorize else v0, "num_features": nf + (plane if factorize else 0)}
 
 
+import torch.nn.functional as _F
+
+_PLANE = {3: (1548, 81), 5: (1710, 81), 7: (1629, 81), 9: (1710, 45), 11: (1629, 45)}
+
+
+def _eff(weight, version):
+    """因数分解を重みの側で行う：W_eff[k×P + p] = W[k×P + p] + W[N + p]（M8）。"""
+    P, nk = _PLANE[version]
+    n = P * nk
+    return (weight[:n].view(nk, P, -1) + weight[n:].unsqueeze(0)).reshape(n, -1)
+
+
+def _table(module, version, base):
+    """第1層の表。base=True で因数分解つきの版なら、W_eff を 1 回だけ作る（M8）。None は従来どおり module を使う。"""
+    if base and version in _PLANE:
+        return _eff(module.weight, version)
+    return None
+
+
+def _bag(module, table, idx, off):
+    if table is None:
+        return module(idx, off)
+    return _F.embedding_bag(idx, table, off, mode="sum")
+
+
 class RayPairNetwork(nn.Module):
     """従来の名前のネットワークの共通部分。サブクラスで特徴数・第2層以降の幅を決める。"""
 
@@ -85,15 +110,16 @@ class RayPairNetwork(nn.Module):
         self.out = nn.Linear(self.L2, 1)
         nn.init.normal_(self.ft.weight, 0.0, 0.01)
 
-    def _accumulate(self, indices, offsets):
-        return self.ft_bias + self.ft(indices, offsets)
+    @property
+    def INPUT_VERSION(self):
+        return self.FEATURE_VERSION - 1 if self.FEATURE_VERSION in _PLANE else self.FEATURE_VERSION
 
-    def forward(self, stm_indices, stm_offsets, nstm_indices, nstm_offsets, kings=None):
+    def forward(self, stm_indices, stm_offsets, nstm_indices, nstm_offsets, kings=None, base=False):
         # 手番側を先に連結する（§F3.2）。kings は従来の名前では使わない
-        x = torch.cat(
-            [self._accumulate(stm_indices, stm_offsets), self._accumulate(nstm_indices, nstm_offsets)],
-            dim=1,
-        )
+        table = _table(self.ft, self.FEATURE_VERSION, base)
+        a = self.ft_bias + _bag(self.ft, table, stm_indices, stm_offsets)
+        b = self.ft_bias + _bag(self.ft, table, nstm_indices, nstm_offsets)
+        x = torch.cat([a, b], dim=1)
         h = torch.clamp(x, 0.0, 1.0)
         h = torch.clamp(self.l1(h), 0.0, 1.0)
         h = torch.clamp(self.l2(h), 0.0, 1.0)
@@ -252,9 +278,13 @@ class ArchNetwork(nn.Module):
     clip_ = RayPairNetwork.clip_
     decay_parameters = RayPairNetwork.decay_parameters
 
-    def forward(self, stm_indices, stm_offsets, nstm_indices, nstm_offsets, kings=None):
-        a = self.ft_bias + self.ft(stm_indices, stm_offsets)
-        b = self.ft_bias + self.ft(nstm_indices, nstm_offsets)
+    INPUT_VERSION = RayPairNetwork.INPUT_VERSION
+
+    def forward(self, stm_indices, stm_offsets, nstm_indices, nstm_offsets, kings=None, base=False):
+        v = self.FEATURE_VERSION
+        table = _table(self.ft, v, base)
+        a = self.ft_bias + _bag(self.ft, table, stm_indices, stm_offsets)
+        b = self.ft_bias + _bag(self.ft, table, nstm_indices, nstm_offsets)
         h0 = torch.clamp(torch.cat([a, b], dim=1), 0.0, 1.0)
         if self.STACKS == 1:
             h = torch.clamp(self.l1(h0), 0.0, 1.0)
@@ -276,8 +306,9 @@ class ArchNetwork(nn.Module):
             z = layer(h, self.out_weight, self.out_bias)[:, 0]
         if self.PSQT:
             # (P_手番側 − P_相手側) / 2（§S12.2）。P は局面の特徴の psqt の和
-            ps = self.psqt(stm_indices, stm_offsets)
-            pn = self.psqt(nstm_indices, nstm_offsets)
+            ptable = _table(self.psqt, v, base)
+            ps = _bag(self.psqt, ptable, stm_indices, stm_offsets)
+            pn = _bag(self.psqt, ptable, nstm_indices, nstm_offsets)
             if bucket is None:
                 z = z + (ps[:, 0] - pn[:, 0]) * 0.5
             else:

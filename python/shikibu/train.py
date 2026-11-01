@@ -254,16 +254,18 @@ def compute_loss(z, score, result, eval_scale, lam):
     return F.binary_cross_entropy_with_logits(z, t)
 
 
-def build_optimizer(model, lr, weight_decay):
+def build_optimizer(model, lr, weight_decay, fused=False):
+    """AdamW。fused は CUDA で使えるときだけ True にする（M8）。False なら従来どおり。"""
     decay = model.decay_parameters()
     ids = {id(p) for p in decay}
     no_decay = [p for p in model.parameters() if id(p) not in ids]
+    kw = {"fused": True} if fused else {}
     return torch.optim.AdamW(
         [
             {"params": decay, "weight_decay": weight_decay},
             {"params": no_decay, "weight_decay": 0.0},
         ],
-        lr=lr,
+        lr=lr, **kw,
     )
 
 
@@ -288,6 +290,59 @@ def to_device(batch, device):
     out["score"] = out["score"].float()
     out["result"] = out["result"].float()
     return out
+
+
+class Prefetcher:
+    """次のバッチの転送を、今のステップの計算と重ねる（M8）。
+
+    CPU では従来どおり（to_device を同期で呼ぶ）。CUDA では、転送専用のストリームと
+    固定メモリの作業領域（2 面を交互に使う）を使い、非同期に送る。
+    送り終わりは event で示し、計算を始める前に ready() で待つ。
+    """
+
+    def __init__(self, device):
+        self.device = device
+        self.cuda = device.type == "cuda"
+        self.stream = torch.cuda.Stream(device) if self.cuda else None
+        self.slots = [{}, {}]   # 面 → {キー: 固定メモリのテンソル}
+        self.events = [None, None]
+        self.n = 0
+
+    def send(self, batch):
+        """ローダーのバッチを device へ送り始める。返り値は (テンソルの dict, event または None)。"""
+        if not self.cuda:
+            return to_device(batch, self.device), None
+        face = self.n % 2
+        self.n += 1
+        if self.events[face] is not None:
+            self.events[face].synchronize()  # この面を前回の転送が読み終わるまで待つ
+        out = {}
+        with torch.cuda.stream(self.stream):
+            for k in BATCH_KEYS:
+                a = torch.from_numpy(batch[k])
+                buf = self.slots[face].get(k)
+                if buf is None or buf.numel() < a.numel() or buf.dtype != a.dtype:
+                    buf = torch.empty(a.numel(), dtype=a.dtype, pin_memory=True)
+                    self.slots[face][k] = buf
+                view = buf[: a.numel()].view(a.shape)
+                view.copy_(a)
+                out[k] = view.to(self.device, non_blocking=True)
+            ev = torch.cuda.Event()
+            ev.record(self.stream)
+        self.events[face] = ev
+        return out, ev
+
+    def ready(self, x, ev):
+        """転送が終わってから計算に使う。CPU では何もしない（to_device で済んでいる）。"""
+        if ev is None:
+            return x
+        cur = torch.cuda.current_stream(self.device)
+        cur.wait_event(ev)
+        for t in x.values():
+            t.record_stream(cur)  # 転送のストリームで作ったテンソルを、計算のストリームで使い終わるまで解放しない
+        x["score"] = x["score"].float()
+        x["result"] = x["result"].float()
+        return x
 
 
 @torch.no_grad()
@@ -387,7 +442,9 @@ class Trainer:
         if shikibu_feat.num_features(self.model.FEATURE_VERSION) != self.model.NUM_FEATURES:
             raise RuntimeError("ネットワークの特徴数が shikibu_feat と一致しない")
         self.model.to(self.device)
-        self.optimizer = build_optimizer(self.model, t["lr"], t["weight_decay"])
+        self.optimizer = build_optimizer(self.model, t["lr"], t["weight_decay"],
+                                         fused=self.device.type == "cuda")
+        self.prefetch = Prefetcher(self.device)
 
         if ck is None:
             self.eval_scale, self.eval_scale_source = self._decide_eval_scale()
@@ -416,7 +473,9 @@ class Trainer:
         self.cache_seen = 0
         if d["cache_dir"]:
             self.status.enter("prefetch", self.log)
-        self._open_loader(loader_state)
+        self._open_loader(loader_state, self.epoch, self.perm)
+        # 学習済みの位置（checkpoint に書く）。先読みの位置（rd_*）とは分けて持つ（M8）
+        self.loader_state = dict(self.loader.state())
 
     def _decide_eval_scale(self):
         """勝敗の欠損を確かめ、eval_scale を決める（§S4）。判定は全ファイルから抜いた局面（scale_sample 以下）で行う。"""
@@ -457,28 +516,32 @@ class Trainer:
             raise RuntimeError("検証データが空")
         return to_device(batch, self.device)
 
-    def _open_loader(self, state):
+    def _open_loader(self, state, epoch, perm):
         d, t = self.d, self.t
         self.loader = None  # 前のローダーを止めてからでないと、キャッシュ先を作り直せない
         self.cache_seen = 0
-        paths = [self.paths[i] for i in self.perm]  # 周回ごとの順番
+        self.rd_epoch, self.rd_perm = epoch, perm  # ローダーが今いる周回と順番（先読みの位置）
+        paths = [self.paths[i] for i in perm]  # 周回ごとの順番
         self.loader = shikibu_feat.BatchLoader(
             paths, t["batch_size"], self.version,
-            shuffle_buffer=d["shuffle_buffer"], seed=t["seed"] + self.epoch,
+            shuffle_buffer=d["shuffle_buffer"], seed=t["seed"] + epoch,
             num_threads=d["num_threads"], cache_dir=d["cache_dir"] or None,
             max_cached=d["max_cached"], resume_state=state,
         )
 
-    def _next_batch(self):
+    def _fetch(self):
+        """次のバッチを読み、device へ送り始める。読んだ位置（周回・順番・loader_state）も一緒に返す（M8）。"""
         batch = next(self.loader, None)
         if batch is None:  # 1周終わった。次の周は seed + 周回番号 の順番で
-            self.epoch += 1
-            self.perm = epoch_perm(len(self.paths), self.t["seed"], self.epoch)
-            self._open_loader(None)
+            self.rd_epoch += 1
+            self.rd_perm = epoch_perm(len(self.paths), self.t["seed"], self.rd_epoch)
+            self._open_loader(None, self.rd_epoch, self.rd_perm)
             batch = next(self.loader, None)
             if batch is None:
                 raise RuntimeError("局面が1つも読めなかった")
-        return batch
+        meta = {"epoch": self.rd_epoch, "perm": self.rd_perm, "loader_state": dict(self.loader.state())}
+        x, ev = self.prefetch.send(batch)
+        return x, ev, meta
 
     def _emit_cache(self):
         if not self.d["cache_dir"]:
@@ -495,7 +558,7 @@ class Trainer:
             "optimizer": self.optimizer.state_dict(),
             "step": self.step,
             "epoch": self.epoch,
-            "loader_state": dict(self.loader.state()),
+            "loader_state": self.loader_state,
             "eval_scale": self.eval_scale,
             "eval_scale_source": self.eval_scale_source,
             "lam": self.lam,
@@ -512,8 +575,8 @@ class Trainer:
         self.log.write({"type": "save", "step": self.step, "epoch": self.epoch, "reason": reason})
         self._emit_cache()
 
-    def _train_step(self, batch):
-        x = to_device(batch, self.device)
+    def _train_step(self, x, ev, meta):
+        x = self.prefetch.ready(x, ev)
         z = self.model(x["stm_indices"], x["stm_offsets"], x["nstm_indices"], x["nstm_offsets"], kings=x["kings"], base=True)
         loss = compute_loss(z, x["score"], x["result"], self.eval_scale, self.lam)
         lr = self.t["lr"] * lr_factor(self.step, self.t["warmup_steps"], self.t["total_steps"],
@@ -524,6 +587,8 @@ class Trainer:
         loss.backward()
         self.optimizer.step()
         clip_weights_(self.model)
+        # このバッチまで学習した。checkpoint に書く位置を、このバッチの位置に進める
+        self.epoch, self.perm, self.loader_state = meta["epoch"], meta["perm"], meta["loader_state"]
         self.step += 1
         self.pos_since_log += int(x["score"].shape[0])
         self.pos_since_print += int(x["score"].shape[0])
@@ -567,16 +632,18 @@ class Trainer:
         self.pending = None
         if self.d["shuffle_buffer"] > 0:
             self.status.enter("buffer_fill", self.log)
-            self.pending = self._next_batch()  # 最初の1回でシャッフルバッファを満たす
+            self.pending = self._fetch()  # 最初の1回でシャッフルバッファを満たす
+        if self.pending is None and self.step < t["max_steps"]:
+            self.pending = self._fetch()
         self.status.enter("train", self.log)
         self.t_train0, self.step_train0 = time.monotonic(), self.step
         self.last_print, self.printed_step = self.t_train0, None
         while self.step < t["max_steps"]:
-            if self.pending is not None:
-                batch, self.pending = self.pending, None
-            else:
-                batch = self._next_batch()
-            loss, lr = self._train_step(batch)
+            cur, self.pending = self.pending, None
+            if self.step + 1 < t["max_steps"]:
+                # 次のバッチを、今のステップの計算を積む前に読んで送り始める（読み込みと計算を重ねる）
+                self.pending = self._fetch()
+            loss, lr = self._train_step(*cur)
 
             now = time.monotonic()
             if self.step % t["log_every_steps"] == 0:

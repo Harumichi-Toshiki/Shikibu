@@ -112,8 +112,8 @@
 
 ## テスト
 
-TEST_RESULT_PLACEHOLDER
+全件（`python -m pytest -q tests`）：**179 件通過**（M1〜M8.1 の 155 件と、M9 の 24 件）。`check_protected.py`：OK。
 
 ## コミット
 
-最終のコミットは、この報告を含むコミット（`git log -1` で確認）。
+最終のコミットは、このファイルと開発記録の行を含むコミット（`git log -1` で確認）。

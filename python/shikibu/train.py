@@ -25,7 +25,7 @@ import torch
 import torch.nn.functional as F
 
 import shikibu_feat
-from shikibu import networks
+from shikibu import ft_triton, networks
 from shikibu.lock import TrainLock
 from shikibu.optim import CombinedOptimizer, LazyAdamRows, is_lazy_state
 
@@ -79,6 +79,7 @@ DEFAULTS = {
         "ft_grad": "dense",       # 第1層の勾配："dense"（従来）・"sparse"（疎。ft_optimizer = "lazy_adam" が必要）
         "ft_optimizer": "adamw",  # "adamw"（従来）・"lazy_adam"（第1層は使った行だけ更新。数学的に AdamW と違う）
         "fast": False,            # CUDA のとき、2 層目以降を bf16 の自動混合精度で計算する（GPU が無ければ無視）
+        "ft_kernel": "torch",     # 第1層の計算："torch"（従来）・"triton"（専用カーネル。M9.1。ft_forward・ft_grad は "dense" のみ）
     },
     "output": {"out_dir": ""},
 }
@@ -164,6 +165,10 @@ def validate(cfg):
         raise ValueError('因数分解つきの網で ft_grad = "sparse" には ft_forward = "sparse" が必要')
     if not isinstance(t["fast"], bool):
         raise ValueError("train.fast は true か false")
+    if t["ft_kernel"] not in ("torch", "triton"):
+        raise ValueError('train.ft_kernel は "torch" か "triton"')
+    if t["ft_kernel"] == "triton" and (t["ft_forward"] != "dense" or t["ft_grad"] != "dense"):
+        raise ValueError('train.ft_kernel = "triton" のときは ft_forward・ft_grad を "dense" にする')
 
 
 def network_name(m):
@@ -572,6 +577,9 @@ class Trainer:
         if shikibu_feat.num_features(self.model.FEATURE_VERSION) != self.model.NUM_FEATURES:
             raise RuntimeError("ネットワークの特徴数が shikibu_feat と一致しない")
         self.model.FT_FORWARD_SPARSE = t["ft_forward"] == "sparse"  # M9（既定 False = 従来の計算）
+        self.model.FT_KERNEL = t["ft_kernel"]                       # M9.1（既定 "torch"）
+        if t["ft_kernel"] == "triton":
+            ft_triton.check_available(self.device)
         self.model.FT_GRAD_SPARSE = t["ft_grad"] == "sparse"
         self.model.to(self.device)
         self.optimizer = build_optimizer(self.model, t["lr"], t["weight_decay"],

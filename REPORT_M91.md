@@ -74,7 +74,7 @@ CPU で小さく回した結果（2 ステップだけの動作確認で、速�
 
 ## テスト
 
-FULL_RESULT_PLACEHOLDER
+全件（`python -m pytest -q tests`）：**184 件通過**（M1〜M9 の 179 件と、M9.1 の 5 件）。`check_protected.py`：OK。
 
 ## 変更したファイル
 

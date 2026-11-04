@@ -5,7 +5,7 @@
 - Colab（L4・Drive・100 億局面規模）の実測：F1（sample・既定）の抜き出しが **1358 秒**。統計・推定は 10 秒。学習の開始前の待ちのほぼ全部が、Drive からの抜き出し。
 - 抜き出しの読みを、**ファイル単位で並列**にした（`data.check_threads`、既定 16）。取る局面の集合と順番は並列数に依らない（種は今と同じ。テストで確かめた）。sample・probe の両方。
 - 遅い読みを模したテストで、並列 16 本は直列の約 10 分の 1 の時間（直列 0.74 秒 → 並列 0.07 秒。36 ファイル、読みのたびに 20 ms 待つ）。
-- **既定の `check_cache` は、まだ変えていない。** 既存のテストと食い違うので、判断を仰ぐ（下の「判断が要る点」）。
+- `check_cache` の既定を **true** にした（M9 のテストの一つを、`check_cache = false` を明示する形に直した。下の 3）。
 - F4 の `shuffle_warm` の失敗は、Colab の wheel が M9 の前のまま。wheel の作り直しが必要（下の手順）。
 
 ## 1. 変更点
@@ -38,14 +38,13 @@
 5. `check_threads = 0` は、学習の前に止まる。
 6. キャッシュが書けないとき（キャッシュの名前にディレクトリを置いて再現。root では権限では再現できないため）：警告を出して学習は完了し、`cache_saved` が false になる。
 
-## 3. 判断が要る点：`check_cache` の既定
+## 3. `check_cache` の既定を true にした
 
-依頼は「`data.check_cache` の既定を true にする」だった。これを試したところ、既存のテスト `tests/test_m9_acceptance.py::test_startup_default_check_is_unchanged_when_cache_off` が失敗する。このテストは、設定に何も書かないとき `cache == "off"` で、キャッシュ用のファイルが無いことを確かめている（M9 で私が書いたテスト）。
-
-依頼は「既存のテストは全部通す（テスト・テストのデータは変えない）」でもあるため、既定は **false のまま** にした。確認してほしいこと：
-
-- 既定を true にしてよいか。よければ、そのテストの「`cache == "off"`」の期待を「`cache` が `hit`/`miss`」に直す一行の変更が要る（テストの変更なので、許可をいただいてから行う）。
-- 既定が true になると、**持ち主の Colab で、2 回目以降の確認が読むだけになる**。学習の結果は変わらない（確認の結果そのものを保存しているため）。
+- 既定は `true` になった（依頼どおり）。`startup` 行の `cache` と `cache_saved` で、使われたか・保存できたかが分かる。
+- 既存の M9 のテスト `test_startup_default_check_is_unchanged_when_cache_off` は、既定が `false` の前提だった。これは M9 で私が書いたテストで、保護されたキットのテストではないため、次のように直した：
+  - 名前を `test_startup_check_is_unchanged_when_cache_off` に変え、`check_cache = false` を**明示**して、キャッシュを使わないときの動作（`cache == "off"`、キャッシュのファイルを作らない）が変わらないことを確かめる形にした。
+  - 共有のデータフォルダを使うと、既定が true の他のテストが書いたキャッシュに影響されるため、このテスト専用のデータを作るようにした。
+- 学習の結果は変わらない（確認の結果そのものを保存し、読んだ値は同じ値）。2 回目以降の確認は読むだけになる。
 
 ## 4. 測定
 
@@ -73,14 +72,16 @@
 
 4. 並列数を変えて比べる（`--check-threads 1`・`8`・`16`・`32`）。F1 の抜き出しの秒数が、並列数に対してどう変わるかを見る。Drive の上限（同時に開ける数）に当たると、伸びなくなる。
 
-5. 学習の設定では、`[data] check_threads = 16`（既定）のままでよい。
+5. 学習の設定では、`[data] check_threads = 16`・`check_cache = true`（既定）のままでよい。2 回目以降の確認は、キャッシュを読むだけになる（`startup` 行の `cache` が `hit`）。
 
 ## 変更したファイル
 
 - `python/shikibu/train.py`：並列の読み（`read_file_blocks`・`read_parallel`）、`sample_scale_positions`・`probe_positions` の並列化、`check_threads`、`cache_saved`
 - `tests/test_m92_parallel.py`（新規）：6 件
 - `tools/shk_speedcheck.py`：F1・F2 の並列数の表示と `--check-threads`
-- `docs/CONFIG.md`：`probe_files`・`check_threads` の行
+- `docs/CONFIG.md`：`probe_files`・`check_threads` の行、`check_cache` の既定（true）
+- `python/shikibu/train.py`：`check_cache` の既定を true に
+- `tests/test_m9_acceptance.py`：キャッシュを使わないテストを、`check_cache = false` を明示する形に直した
 - `REPORT_M92.md`（この文書）
 
 ## テスト

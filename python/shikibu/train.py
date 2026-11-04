@@ -50,7 +50,7 @@ DEFAULTS = {
         "probe_records": 3000,    # probe のとき、1 ファイルから読む局面数（3 ブロックに分ける）
         "probe_files": 0,         # probe のとき、読むファイル数の上限（0 なら全ファイル。読む回数は 3 × この数）
         "check_threads": 16,      # 確認の読みを並列に行う本数（M9.2）。1 なら並列なし。結果は変わらない
-        "check_cache": False,     # 確認の結果を、データのフォルダに保存して、次回から読むだけにする（M9）
+        "check_cache": True,      # 確認の結果を、データのフォルダに保存して、次回から読むだけにする（M9・既定は M9.2 で true）
         "shuffle_warm": 0,        # 0 は従来どおり（バッファを満たしてから学習）。>0 なら、この件数から学習を始める
     },
     "model": {"network": "RayPair_v0Network", "ft_width": 0},  # ft_width 0 = 名前に合わせる（従来の名前なら 128）

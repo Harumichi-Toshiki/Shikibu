@@ -81,10 +81,39 @@ def _table(module, version, base):
     return None
 
 
+def _ft_table(net, module, base):
+    """dense（既定）の経路の表。sparse の経路（FT_FORWARD_SPARSE）では W_eff を作らないので None（M9）。"""
+    if net.FT_FORWARD_SPARSE and base:
+        return None
+    return _table(module, net.FEATURE_VERSION, base)
+
+
 def _bag(module, table, idx, off):
     if table is None:
         return module(idx, off)
     return _F.embedding_bag(idx, table, off, mode="sum")
+
+
+def _bag_ft(net, module, table, base, idx, off, sparse):
+    """第1層（と psqt）の有効な行の和（§F3.2）。
+
+    - 因数分解つきで FT_FORWARD_SPARSE のとき：W_eff[k×P+p] = W[k×P+p] + W[N+p] の和を、
+      「本体の行の和」＋「共通部分の行（idx mod P）の和」で作る。W_eff を作らないので、密な計算がない（M9）。
+    - それ以外は従来どおり（table があれば密な W_eff の表。なければ module）。sparse は勾配を疎にする（FT_GRAD_SPARSE）。
+    """
+    v = net.FEATURE_VERSION
+    if base and v in _PLANE and net.FT_FORWARD_SPARSE:
+        P, nk = _PLANE[v]
+        n = P * nk
+        return (_F.embedding_bag(idx, module.weight, off, mode="sum", sparse=sparse)
+                + _F.embedding_bag(idx % P + n, module.weight, off, mode="sum", sparse=sparse))
+    if table is not None:
+        if sparse:
+            raise ValueError("因数分解つきの疎な勾配には ft_forward = \"sparse\" が必要")
+        return _F.embedding_bag(idx, table, off, mode="sum")
+    if sparse:
+        return _F.embedding_bag(idx, module.weight, off, mode="sum", sparse=True)
+    return module(idx, off)
 
 
 class RayPairNetwork(nn.Module):
@@ -97,6 +126,8 @@ class RayPairNetwork(nn.Module):
     PSQT = False            # 従来の名前は psqt なし
     STACKS = 1              # 従来の名前は層を 1 組だけ持つ
     NEEDS_KINGS = False
+    FT_FORWARD_SPARSE = False  # M9：第1層の順伝播を有効な行だけで行う（既定 False = 従来の計算）
+    FT_GRAD_SPARSE = False     # M9：第1層の勾配を疎にする（オプティマイザは遅延型）
 
     def __init__(self, ft_width=128):
         super().__init__()
@@ -116,9 +147,10 @@ class RayPairNetwork(nn.Module):
 
     def forward(self, stm_indices, stm_offsets, nstm_indices, nstm_offsets, kings=None, base=False):
         # 手番側を先に連結する（§F3.2）。kings は従来の名前では使わない
-        table = _table(self.ft, self.FEATURE_VERSION, base)
-        a = self.ft_bias + _bag(self.ft, table, stm_indices, stm_offsets)
-        b = self.ft_bias + _bag(self.ft, table, nstm_indices, nstm_offsets)
+        table = _ft_table(self, self.ft, base)
+        sp = self.FT_GRAD_SPARSE
+        a = self.ft_bias + _bag_ft(self, self.ft, table, base, stm_indices, stm_offsets, sp)
+        b = self.ft_bias + _bag_ft(self, self.ft, table, base, nstm_indices, nstm_offsets, sp)
         x = torch.cat([a, b], dim=1)
         h = torch.clamp(x, 0.0, 1.0)
         h = torch.clamp(self.l1(h), 0.0, 1.0)
@@ -148,9 +180,13 @@ class RayPairNetwork(nn.Module):
             v.copy_(d[k].to(device=v.device, dtype=v.dtype))
 
     @torch.no_grad()
-    def clip_(self, limit):
-        """§F3.3 のクリップ。ft の重みと bias は ±1、Linear の重みは ±limit。psqt はクリップしない。"""
-        self.ft.weight.clamp_(-1.0, 1.0)
+    def clip_(self, limit, ft=True):
+        """§F3.3 のクリップ。ft の重みと bias は ±1、Linear の重みは ±limit。psqt はクリップしない。
+
+        ft=False なら ft の重みは触らない（遅延型のオプティマイザが、使った行だけを先に収める。M9）。
+        """
+        if ft:
+            self.ft.weight.clamp_(-1.0, 1.0)
         self.ft_bias.clamp_(-1.0, 1.0)
         t = self._named_tensors()
         for k in ("l1_weight", "l2_weight", "out_weight"):
@@ -240,6 +276,8 @@ class ArchNetwork(nn.Module):
         self.PSQT = p["psqt"]
         self.STACKS = S = p["stacks"]
         self.NEEDS_KINGS = S > 1
+        self.FT_FORWARD_SPARSE = False  # M9（学習の設定で変える）
+        self.FT_GRAD_SPARSE = False
         self.ft = nn.EmbeddingBag(self.NUM_FEATURES, W, mode="sum")
         self.ft_bias = nn.Parameter(torch.zeros(W))
         nn.init.normal_(self.ft.weight, 0.0, 0.01)
@@ -282,9 +320,10 @@ class ArchNetwork(nn.Module):
 
     def forward(self, stm_indices, stm_offsets, nstm_indices, nstm_offsets, kings=None, base=False):
         v = self.FEATURE_VERSION
-        table = _table(self.ft, v, base)
-        a = self.ft_bias + _bag(self.ft, table, stm_indices, stm_offsets)
-        b = self.ft_bias + _bag(self.ft, table, nstm_indices, nstm_offsets)
+        table = _ft_table(self, self.ft, base)
+        sp = self.FT_GRAD_SPARSE
+        a = self.ft_bias + _bag_ft(self, self.ft, table, base, stm_indices, stm_offsets, sp)
+        b = self.ft_bias + _bag_ft(self, self.ft, table, base, nstm_indices, nstm_offsets, sp)
         h0 = torch.clamp(torch.cat([a, b], dim=1), 0.0, 1.0)
         if self.STACKS == 1:
             h = torch.clamp(self.l1(h0), 0.0, 1.0)
@@ -306,9 +345,9 @@ class ArchNetwork(nn.Module):
             z = layer(h, self.out_weight, self.out_bias)[:, 0]
         if self.PSQT:
             # (P_手番側 − P_相手側) / 2（§S12.2）。P は局面の特徴の psqt の和
-            ptable = _table(self.psqt, v, base)
-            ps = _bag(self.psqt, ptable, stm_indices, stm_offsets)
-            pn = _bag(self.psqt, ptable, nstm_indices, nstm_offsets)
+            ptable = _ft_table(self, self.psqt, base)
+            ps = _bag_ft(self, self.psqt, ptable, base, stm_indices, stm_offsets, False)
+            pn = _bag_ft(self, self.psqt, ptable, base, nstm_indices, nstm_offsets, False)
             if bucket is None:
                 z = z + (ps[:, 0] - pn[:, 0]) * 0.5
             else:

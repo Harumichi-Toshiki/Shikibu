@@ -125,6 +125,7 @@ python perf/perf_check.py --profile colab                        # Colab 本番�
 | **M7** 評価関数の構造の実験室 | 構造の名前（`<特徴>_<W>x2-<L1>-<L2>[_f][_psqt][_k3k3]`）で、特徴（版 0〜13）・幅・層・オプションを切り替えて学習。`nn.bin`（halfk… の任意の幅）と `.shk`（raypair0・1 の任意の幅）の書き出し、`shikibu.lab`、実験室のノートブック | 142 件通過（M1〜M6 の 100 件と、M7 の 42 件）。`REPORT_M7.md` |
 | **M8** 学習の高速化 | 因数分解を重みの側で行う（`INPUT_VERSION`、`forward(base=True)` で、W_eff を forward ごとに 1 回作る）。次のバッチの読み込みと転送を、今のステップの計算と重ねる（CUDA は固定メモリ 2 面と転送のストリーム、CPU は従来どおり）。CUDA で fused AdamW。`tools/shk_speedcheck.py` を学習の 1 ステップで測る形に直した。checkpoint の形・書き出し・数学は変えていない | 151 件通過（M1〜M7 の 142 件と、M8 の 9 件）。`REPORT_M8.md`。CUDA の速さは未計測（持ち主が Colab で測る） |
 | **M8.1** 壊れたレコードを飛ばして学習を続ける | 読み解けないレコードと game_result が範囲外のレコードを `BatchLoader` で飛ばして数える（`skipped()`）。学習のログ（`bad_records`）と checkpoint に数を保存し、再開しても続けて数える。最初の 1 回だけ標準出力に知らせる | 155 件通過（M1〜M8 の 151 件と、M8.1 の 4 件）。`REPORT_M81.md` |
+| **M9** 学習の開始前の待ち時間と第1層の速さ | 開始前：確認の抜き取り方式（sample/probe/full）・結果のキャッシュ（check_cache）・shuffle_warm・開始時間の記録（startup 行）。第1層：疎な順伝播（ft_forward）・疎な勾配（ft_grad）・遅延型 Adam（ft_optimizer = lazy_adam）・bf16（fast）。既定はすべて従来どおり。遅延型 Adam は AdamW と数学的に違う | 179 件通過（M1〜M8.1 の 155 件と、M9 の 24 件）。`REPORT_M9.md`。GPU の速さと Drive 上の開始時間は未計測（持ち主が Colab で測る） |
 
 ### 4.1 各マイルストーンで決まったこと（要点）
 

@@ -9,6 +9,7 @@
 """
 import argparse
 import glob
+import hashlib
 import json
 import math
 import os
@@ -26,6 +27,7 @@ import torch.nn.functional as F
 import shikibu_feat
 from shikibu import networks
 from shikibu.lock import TrainLock
+from shikibu.optim import CombinedOptimizer, LazyAdamRows, is_lazy_state
 
 # CUDA で決定的な計算（use_deterministic_algorithms）を使うときに必要。torch の CUDA 初期化より前に設定する。
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
@@ -44,6 +46,11 @@ DEFAULTS = {
         "max_cached": 3,
         "shuffle_buffer": 0,
         "num_threads": 1,
+        "check_mode": "sample",   # 勝敗の確認の抜き取り："sample"（従来）・"probe"（各ファイルの先頭・中央・末尾）・"full"（全件）
+        "probe_records": 3000,    # probe のとき、1 ファイルから読む局面数（3 ブロックに分ける）
+        "probe_files": 0,         # probe のとき、読むファイル数の上限（0 なら全ファイル。読む回数は 3 × この数）
+        "check_cache": False,     # 確認の結果を、データのフォルダに保存して、次回から読むだけにする（M9）
+        "shuffle_warm": 0,        # 0 は従来どおり（バッファを満たしてから学習）。>0 なら、この件数から学習を始める
     },
     "model": {"network": "RayPair_v0Network", "ft_width": 0},  # ft_width 0 = 名前に合わせる（従来の名前なら 128）
     "train": {
@@ -68,6 +75,10 @@ DEFAULTS = {
         "val_positions": 100_000,
         "log_every_steps": 100,
         "progress_every_sec": 30.0,
+        "ft_forward": "dense",    # 第1層の順伝播："dense"（従来）・"sparse"（有効な行だけ。因数分解つきでも密な表を作らない）
+        "ft_grad": "dense",       # 第1層の勾配："dense"（従来）・"sparse"（疎。ft_optimizer = "lazy_adam" が必要）
+        "ft_optimizer": "adamw",  # "adamw"（従来）・"lazy_adam"（第1層は使った行だけ更新。数学的に AdamW と違う）
+        "fast": False,            # CUDA のとき、2 層目以降を bf16 の自動混合精度で計算する（GPU が無ければ無視）
     },
     "output": {"out_dir": ""},
 }
@@ -135,6 +146,24 @@ def validate(cfg):
     _check_min(t, "save_every_steps", 0)  # 0 は無効
     _check_min(t, "val_every_steps", 0)   # 0 は無効
     _check_min(t, "progress_every_sec", 0.0)
+    if d["check_mode"] not in ("sample", "probe", "full"):
+        raise ValueError('data.check_mode は "sample"・"probe"・"full" のどれか')
+    _check_min(d, "probe_records", 3)
+    if not isinstance(d["probe_files"], int) or d["probe_files"] < 0:
+        raise ValueError("data.probe_files は 0 以上の整数（0 なら全ファイル）")
+    if not isinstance(d["shuffle_warm"], int) or not 0 <= d["shuffle_warm"] <= d["shuffle_buffer"]:
+        raise ValueError("data.shuffle_warm は 0 以上で、shuffle_buffer 以下の整数")
+    if t["ft_forward"] not in ("dense", "sparse") or t["ft_grad"] not in ("dense", "sparse"):
+        raise ValueError('train.ft_forward・ft_grad は "dense" か "sparse"')
+    if t["ft_optimizer"] not in ("adamw", "lazy_adam"):
+        raise ValueError('train.ft_optimizer は "adamw" か "lazy_adam"')
+    if t["ft_grad"] == "sparse" and t["ft_optimizer"] != "lazy_adam":
+        raise ValueError('train.ft_grad = "sparse" には ft_optimizer = "lazy_adam" が必要（AdamW は疎な勾配を扱えない）')
+    if t["ft_grad"] == "sparse" and t["ft_forward"] != "sparse" and networks.parse_arch(networks.arch_of(
+            network_name(cfg["model"]), cfg["model"]["ft_width"] or 128))["factorize"]:
+        raise ValueError('因数分解つきの網で ft_grad = "sparse" には ft_forward = "sparse" が必要')
+    if not isinstance(t["fast"], bool):
+        raise ValueError("train.fast は true か false")
 
 
 def network_name(m):
@@ -210,6 +239,89 @@ def sample_scale_positions(paths, limit, seed, out_path):
     return [out_path], count
 
 
+def probe_positions(paths, per_file, out_path, max_files=0, seed=0):
+    """抜き取り（data.check_mode = "probe"，M9）：各ファイルの先頭・中央・末尾から per_file/3 件ずつ読む。
+
+    ファイルの大きさは全ファイルについて先に検査する（stat だけ。40 の倍数でなければ止める）。
+    max_files > 0 なら、seed で決まる無作為な max_files 個のファイルだけを読む（読む回数を抑える）。
+    勝敗が 1・0・−1 でない局面は飛ばして数える。返り値：(使うファイルのリスト, 局面数, 飛ばした数)。
+    局面は out_path に書く（ローカル）。
+    """
+    n_of = {}
+    for p in paths:
+        nbytes = os.path.getsize(p)
+        if nbytes % PSV_BYTES:
+            raise RuntimeError(f"{p}: サイズが40バイトの倍数でない（壊れたファイル）")
+        n_of[p] = nbytes // PSV_BYTES
+    read_paths = list(paths)
+    if max_files > 0 and max_files < len(read_paths):
+        pick = sorted(random.Random(seed).sample(range(len(read_paths)), max_files))
+        read_paths = [read_paths[i] for i in pick]
+    per_block = max(1, per_file // 3)
+    count = skipped = 0
+    with open(out_path, "wb") as out:
+        for p in read_paths:
+            n = n_of[p]
+            if n == 0:
+                continue
+            length = min(per_block, n)
+            starts = sorted({0, (n - length) // 2, n - length})
+            with open(p, "rb") as f:
+                for st in starts:
+                    f.seek(st * PSV_BYTES)
+                    buf = np.frombuffer(f.read(length * PSV_BYTES), dtype=np.uint8).reshape(-1, PSV_BYTES)
+                    res = buf[:, 38].astype(np.int8)
+                    keep = buf[(res >= -1) & (res <= 1)]
+                    out.write(keep.tobytes())
+                    count += len(keep)
+                    skipped += len(buf) - len(keep)
+    return [out_path], count, skipped
+
+
+CHECK_CACHE_NAME = "shikibu_check_cache.json"  # データのフォルダに置く（*.psv には当たらない名前）
+CHECK_CACHE_KEEP = 8
+
+
+def check_key(paths, d, t):
+    """確認の結果の鍵：ファイルの名前・大きさ・更新時刻と、確認の設定。どれかが変われば作り直す（M9）。"""
+    sig = {"v": 1,
+           "files": [[os.path.realpath(p), os.path.getsize(p), os.stat(p).st_mtime_ns] for p in paths],
+           "mode": d["check_mode"], "probe_records": d["probe_records"], "probe_files": d["probe_files"],
+           "scale_sample": t["scale_sample"], "seed": t["seed"]}
+    return hashlib.sha256(json.dumps(sig, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def check_cache_path(paths):
+    return os.path.join(os.path.dirname(os.path.realpath(paths[0])), CHECK_CACHE_NAME)
+
+
+def read_check_cache(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}  # 無い・壊れている・読めないときは、無かったものとして作り直す
+
+
+def write_check_cache(path, key, entry):
+    """確認の結果を書く（一時ファイル→改名）。書けなくても学習は続ける。"""
+    data = read_check_cache(path)
+    data.pop(key, None)
+    data[key] = entry
+    while len(data) > CHECK_CACHE_KEEP:
+        data.pop(next(iter(data)))
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, path)
+        return True
+    except OSError as e:
+        print(f"確認の結果を保存できなかった（学習は続ける）: {e}", file=sys.stderr, flush=True)
+        return False
+
+
 def pick_device(name):
     if name == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -243,9 +355,9 @@ def restore_rng(st):
 
 
 @torch.no_grad()
-def clip_weights_(model):
-    """§F3.3：各ステップの後に範囲へ収める。bias・psqt は対象外。"""
-    model.clip_(LIMIT)
+def clip_weights_(model, ft=True):
+    """§F3.3：各ステップの後に範囲へ収める。bias・psqt は対象外。ft=False なら第1層の重みは触らない（M9）。"""
+    model.clip_(LIMIT, ft=ft)
 
 
 def compute_loss(z, score, result, eval_scale, lam):
@@ -254,19 +366,32 @@ def compute_loss(z, score, result, eval_scale, lam):
     return F.binary_cross_entropy_with_logits(z, t)
 
 
-def build_optimizer(model, lr, weight_decay, fused=False):
-    """AdamW。fused は CUDA で使えるときだけ True にする（M8）。False なら従来どおり。"""
+def build_optimizer(model, lr, weight_decay, fused=False, ft_optimizer="adamw"):
+    """AdamW。fused は CUDA で使えるときだけ True にする（M8）。False なら従来どおり。
+
+    ft_optimizer = "lazy_adam" のときは、第1層の重み（ft）だけ遅延型の Adam にする（M9）。
+    """
     decay = model.decay_parameters()
     ids = {id(p) for p in decay}
-    no_decay = [p for p in model.parameters() if id(p) not in ids]
+    lazy = ft_optimizer == "lazy_adam"
+    ft_id = id(model.ft.weight) if lazy else None
+    no_decay = [p for p in model.parameters() if id(p) not in ids and id(p) != ft_id]
     kw = {"fused": True} if fused else {}
-    return torch.optim.AdamW(
+    adamw = torch.optim.AdamW(
         [
             {"params": decay, "weight_decay": weight_decay},
             {"params": no_decay, "weight_decay": 0.0},
         ],
         lr=lr, **kw,
     )
+    if lazy:
+        return CombinedOptimizer(adamw, LazyAdamRows(model.ft.weight, lr))
+    return adamw
+
+
+def autocast_bf16(device, fast):
+    """fast のとき、CUDA で bf16 の自動混合精度を使う文脈（M9）。CPU では何もしない。"""
+    return torch.autocast("cuda", dtype=torch.bfloat16, enabled=bool(fast) and device.type == "cuda")
 
 
 def lr_factor(step, warmup_steps, total_steps, min_lr_ratio):
@@ -346,10 +471,12 @@ class Prefetcher:
 
 
 @torch.no_grad()
-def evaluate(model, val, eval_scale, lam):
+def evaluate(model, val, eval_scale, lam, device=None, fast=False):
     """検証：(val_loss, val_mse)。val_mse = mean((sigmoid(z) − sigmoid(score / eval_scale))²)。"""
     model.eval()
-    z = model(val["stm_indices"], val["stm_offsets"], val["nstm_indices"], val["nstm_offsets"], kings=val["kings"], base=True)
+    with autocast_bf16(device or torch.device("cpu"), fast):
+        z = model(val["stm_indices"], val["stm_offsets"], val["nstm_indices"], val["nstm_offsets"], kings=val["kings"], base=True)
+    z = z.float()
     loss = compute_loss(z, val["score"], val["result"], eval_scale, lam)
     target = torch.sigmoid(val["score"] / eval_scale)
     mse = ((torch.sigmoid(z) - target) ** 2).mean()
@@ -423,6 +550,9 @@ class Trainer:
         self.saved_step = -1
         self.network = network_name(m)
         self.scale_used = None  # 勝敗の確認と推定に使った局面数（新規の学習でだけ決まる）
+        self.timing = {}        # 開始前の段階の時間（秒）。startup の行に書く（M9）
+        self.cache_state = "off"  # 確認の結果のキャッシュ："off"・"hit"・"miss"
+        self.lazy = t["ft_optimizer"] == "lazy_adam"
 
         ck = None
         if os.path.exists(self.ckpt_path):
@@ -441,17 +571,23 @@ class Trainer:
         self.version = self.model.INPUT_VERSION  # 因数分解つきでも、ローダーは因数分解なしの版（M8）
         if shikibu_feat.num_features(self.model.FEATURE_VERSION) != self.model.NUM_FEATURES:
             raise RuntimeError("ネットワークの特徴数が shikibu_feat と一致しない")
+        self.model.FT_FORWARD_SPARSE = t["ft_forward"] == "sparse"  # M9（既定 False = 従来の計算）
+        self.model.FT_GRAD_SPARSE = t["ft_grad"] == "sparse"
         self.model.to(self.device)
         self.optimizer = build_optimizer(self.model, t["lr"], t["weight_decay"],
-                                         fused=self.device.type == "cuda")
+                                         fused=self.device.type == "cuda", ft_optimizer=t["ft_optimizer"])
         self.prefetch = Prefetcher(self.device)
 
         if ck is None:
+            t0 = time.monotonic()
             self.eval_scale, self.eval_scale_source = self._decide_eval_scale()
+            self.timing["data_check"] = time.monotonic() - t0
             self.step, self.epoch, loader_state = 0, 0, None
             self.perm = epoch_perm(len(self.paths), t["seed"], 0)
         else:
             self.model.load_state_dict(ck["model"])
+            if is_lazy_state(ck["optimizer"]) != self.lazy:
+                raise ValueError("checkpoint の optimizer（train.ft_optimizer）が設定と違う")
             self.optimizer.load_state_dict(ck["optimizer"])
             self.eval_scale, self.eval_scale_source = ck["eval_scale"], ck["eval_scale_source"]
             self.step, self.epoch, loader_state = ck["step"], ck["epoch"], ck["loader_state"]
@@ -482,32 +618,81 @@ class Trainer:
         # 学習済みの位置（checkpoint に書く）。先読みの位置（rd_*）とは分けて持つ（M8）
         self.loader_state = dict(self.loader.state())
 
-    def _decide_eval_scale(self):
-        """勝敗の欠損を確かめ、eval_scale を決める（§S4）。判定は全ファイルから抜いた局面（scale_sample 以下）で行う。"""
+    def _check_missing(self, missing, setting):
+        """勝敗の欠損の扱い（§S4）。欠損のときに使えない組み合わせは止める。"""
         t, lam = self.t, self.lam
+        if missing:
+            if not t["allow_missing_results"]:
+                raise RuntimeError("勝敗が欠損している（psv_stats）。データを確認するか allow_missing_results = true にする")
+            if lam != 1.0:
+                raise RuntimeError("勝敗が欠損のときは lam = 1.0 が必要")
+            if setting is None:
+                raise RuntimeError("勝敗が欠損のときは eval_scale を数値で指定する")
+
+    def _check_files(self, sample_path):
+        """確認に使う局面（check_mode）。返り値：(使うファイルのリスト, 局面数)。"""
+        d, t = self.d, self.t
+        mode = d["check_mode"]
+        if mode == "full":
+            total = 0
+            for p in self.paths:
+                nbytes = os.path.getsize(p)
+                if nbytes % PSV_BYTES:
+                    raise RuntimeError(f"{p}: サイズが40バイトの倍数でない（壊れたファイル）")
+                total += nbytes // PSV_BYTES
+            return list(self.paths), total  # 全件を読む（psv_stats）。時間は全データの大きさに比例する
+        if mode == "probe":
+            files, count, skipped = probe_positions(self.paths, d["probe_records"], sample_path,
+                                                    max_files=d["probe_files"], seed=t["seed"])
+            if skipped:
+                print(f"抜き取りで、勝敗が 1・0・−1 でない局面を {skipped} 件飛ばした", flush=True)
+            return files, count
+        return sample_scale_positions(self.paths, t["scale_sample"], t["seed"], sample_path)
+
+    def _decide_eval_scale(self):
+        """勝敗の欠損を確かめ、eval_scale を決める（§S4）。確認は check_mode の抜き取りで行う。
+
+        check_cache = true なら、結果をデータのフォルダに保存し、同じデータ・同じ設定なら読むだけにする（M9）。
+        """
+        d, t, lam = self.d, self.t, self.lam
         setting = eval_scale_setting(t["eval_scale"])
         self.status.enter("data_check")
+        cache_path = key = None
+        if d["check_cache"]:
+            cache_path, key = check_cache_path(self.paths), check_key(self.paths, d, t)
+            hit = read_check_cache(cache_path).get(key)
+            if hit is not None and (setting is not None or hit.get("eval_scale") is not None):
+                self.cache_state = "hit"
+                self.scale_used = hit["count"]
+                self._check_missing(bool(hit["result_missing"]), setting)
+                if setting is not None:
+                    return setting, "config"
+                return float(hit["eval_scale"]), "auto"
+            self.cache_state = "miss"
         sample_path = os.path.join(tempfile.gettempdir(), "shikibu_scale_sample.psv")  # ローカルに書く（Drive には書かない）
-        files, count = sample_scale_positions(self.paths, t["scale_sample"], t["seed"], sample_path)
-        self.scale_used = count
+        files = None
         try:
+            files, count = self._check_files(sample_path)
+            self.scale_used = count
             if count == 0:
                 raise RuntimeError("学習データに局面が1つも無い")
             stats = shikibu_feat.psv_stats(files)
-            if stats["result_missing"]:
-                if not t["allow_missing_results"]:
-                    raise RuntimeError("勝敗が欠損している（psv_stats）。データを確認するか allow_missing_results = true にする")
-                if lam != 1.0:
-                    raise RuntimeError("勝敗が欠損のときは lam = 1.0 が必要")
-                if setting is None:
-                    raise RuntimeError("勝敗が欠損のときは eval_scale を数値で指定する")
+            missing = bool(stats["result_missing"])
+            self._check_missing(missing, setting)
+            est = None
+            if setting is None:
+                self.status.enter("eval_scale")
+                # 推定に使う局面は scale_sample 以下（全件モードでも、全件を標本にしない）
+                est = float(shikibu_feat.estimate_eval_scale(files, sample=min(count, t["scale_sample"]),
+                                                             seed=t["seed"])["eval_scale"])
+            if cache_path is not None:
+                write_check_cache(cache_path, key, {"count": count, "result_missing": missing,
+                                                    "eval_scale": est, "saved": time.time()})
             if setting is not None:
                 return setting, "config"
-            self.status.enter("eval_scale")
-            est = shikibu_feat.estimate_eval_scale(files, sample=count, seed=t["seed"])
-            return float(est["eval_scale"]), "auto"
+            return est, "auto"
         finally:
-            if files != list(self.paths) and os.path.exists(sample_path):
+            if files is not None and files != list(self.paths) and os.path.exists(sample_path):
                 os.remove(sample_path)
 
     def _load_validation(self):
@@ -536,7 +721,7 @@ class Trainer:
             paths, t["batch_size"], self.version,
             shuffle_buffer=d["shuffle_buffer"], seed=t["seed"] + epoch,
             num_threads=d["num_threads"], cache_dir=d["cache_dir"] or None,
-            max_cached=d["max_cached"], resume_state=state,
+            max_cached=d["max_cached"], resume_state=state, shuffle_warm=d["shuffle_warm"],
         )
 
     def _fetch(self):
@@ -593,7 +778,9 @@ class Trainer:
 
     def _train_step(self, x, ev, meta):
         x = self.prefetch.ready(x, ev)
-        z = self.model(x["stm_indices"], x["stm_offsets"], x["nstm_indices"], x["nstm_offsets"], kings=x["kings"], base=True)
+        with autocast_bf16(self.device, self.t["fast"]):
+            z = self.model(x["stm_indices"], x["stm_offsets"], x["nstm_indices"], x["nstm_offsets"], kings=x["kings"], base=True)
+        z = z.float()
         loss = compute_loss(z, x["score"], x["result"], self.eval_scale, self.lam)
         lr = self.t["lr"] * lr_factor(self.step, self.t["warmup_steps"], self.t["total_steps"],
                                       self.t["min_lr_ratio"])
@@ -602,7 +789,7 @@ class Trainer:
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
         self.optimizer.step()
-        clip_weights_(self.model)
+        clip_weights_(self.model, ft=not self.lazy)  # 遅延型は第1層の行を optimizer の中で収める（M9）
         # このバッチまで学習した。checkpoint に書く位置を、このバッチの位置に進める
         self.epoch, self.perm, self.loader_state = meta["epoch"], meta["perm"], meta["loader_state"]
         self.bad_records = meta["bad"]
@@ -647,11 +834,18 @@ class Trainer:
         t = self.t
         save_interval = t["save_every_minutes"] * 60.0
         self.pending = None
-        if self.d["shuffle_buffer"] > 0:
+        t_fill = time.monotonic()
+        if self.d["shuffle_buffer"] > 0 and self.d["shuffle_warm"] == 0:
             self.status.enter("buffer_fill", self.log)
             self.pending = self._fetch()  # 最初の1回でシャッフルバッファを満たす
         if self.pending is None and self.step < t["max_steps"]:
-            self.pending = self._fetch()
+            self.pending = self._fetch()  # shuffle_warm > 0 のときは、少ない件数から始める（M9）
+        self.timing["first_batch"] = time.monotonic() - t_fill
+        self.log.write({"type": "startup", "seconds": {k: round(v, 3) for k, v in self.timing.items()},
+                        "cache": self.cache_state, "check_mode": self.d["check_mode"],
+                        "scale_positions_used": self.scale_used, "shuffle_warm": self.d["shuffle_warm"],
+                        "ft_forward": t["ft_forward"], "ft_grad": t["ft_grad"],
+                        "ft_optimizer": t["ft_optimizer"], "fast": t["fast"]})
         self.status.enter("train", self.log)
         self.t_train0, self.step_train0 = time.monotonic(), self.step
         self.last_print, self.printed_step = self.t_train0, None
@@ -677,7 +871,8 @@ class Trainer:
                 self._report(now)
 
             if self.val is not None and t["val_every_steps"] > 0 and self.step % t["val_every_steps"] == 0:
-                val_loss, val_mse = evaluate(self.model, self.val, self.eval_scale, self.lam)
+                val_loss, val_mse = evaluate(self.model, self.val, self.eval_scale, self.lam,
+                                             device=self.device, fast=t["fast"])
                 self.log.write({"type": "val", "step": self.step, "val_loss": val_loss, "val_mse": val_mse})
 
             periodic = t["save_every_steps"] > 0 and self.step % t["save_every_steps"] == 0

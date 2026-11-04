@@ -85,7 +85,7 @@
 
 ## テスト
 
-FULL_RESULT_PLACEHOLDER
+全件（`python -m pytest -q tests`）：**190 件通過**（M1〜M9.1 の 184 件と、M9.2 の 6 件）。`check_protected.py`：OK。
 
 ## コミット
 

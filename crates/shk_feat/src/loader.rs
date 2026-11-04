@@ -402,6 +402,7 @@ fn produce(
     start: Cursor,
     batch_size: usize,
     shuffle: usize,
+    warm: usize,
     credit: Receiver<()>,
     work: Sender<Work>,
 ) {
@@ -410,8 +411,10 @@ fn produce(
     let mut pool: Vec<[u8; REC]> = Vec::with_capacity(shuffle);
     let mut raw: Vec<u8> = Vec::with_capacity(batch_size * REC);
     let mut seq = 0u64;
+    // バッファの目標の大きさ。warm > 0 なら warm から始めて、バッチを出すたびに batch_size ずつ shuffle まで増やす（M9）
+    let mut target = if warm > 0 { warm } else { shuffle };
     loop {
-        match next_record(&mut src, &mut pool, &mut rng, shuffle) {
+        match next_record(&mut src, &mut pool, &mut rng, target) {
             Ok(Some(rec)) => {
                 raw.extend_from_slice(&rec);
                 if raw.len() == batch_size * REC {
@@ -420,6 +423,9 @@ fn produce(
                         return;
                     }
                     seq += 1;
+                    if target < shuffle {
+                        target = (target + batch_size).min(shuffle);
+                    }
                 }
             }
             Ok(None) => {
@@ -543,7 +549,7 @@ pub struct BatchLoader {
 impl BatchLoader {
     #[new]
     #[pyo3(signature = (paths, batch_size, version, shuffle_buffer=0, seed=0, num_threads=1,
-                        cache_dir=None, max_cached=3, resume_state=None))]
+                        cache_dir=None, max_cached=3, resume_state=None, shuffle_warm=0))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         paths: Vec<String>,
@@ -555,10 +561,14 @@ impl BatchLoader {
         cache_dir: Option<String>,
         max_cached: usize,
         resume_state: Option<Bound<'_, PyDict>>,
+        shuffle_warm: usize,
     ) -> PyResult<Self> {
         let version = crate::check_version(version)?;
         if batch_size == 0 {
             return Err(PyValueError::new_err("batch_size は1以上"));
+        }
+        if shuffle_warm > shuffle_buffer {
+            return Err(PyValueError::new_err("shuffle_warm は shuffle_buffer 以下（0 なら従来どおり）"));
         }
         if num_threads == 0 {
             return Err(PyValueError::new_err("num_threads は1以上"));
@@ -614,7 +624,7 @@ impl BatchLoader {
         {
             let (p, c) = (paths.clone(), cache.clone());
             threads.push(thread::spawn(move || {
-                produce(p, c, start, batch_size, shuffle_buffer, credit_rx, work_tx)
+                produce(p, c, start, batch_size, shuffle_buffer, shuffle_warm, credit_rx, work_tx)
             }));
         }
         for _ in 0..num_threads {

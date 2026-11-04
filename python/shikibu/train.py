@@ -49,6 +49,7 @@ DEFAULTS = {
         "check_mode": "sample",   # 勝敗の確認の抜き取り："sample"（従来）・"probe"（各ファイルの先頭・中央・末尾）・"full"（全件）
         "probe_records": 3000,    # probe のとき、1 ファイルから読む局面数（3 ブロックに分ける）
         "probe_files": 0,         # probe のとき、読むファイル数の上限（0 なら全ファイル。読む回数は 3 × この数）
+        "check_threads": 16,      # 確認の読みを並列に行う本数（M9.2）。1 なら並列なし。結果は変わらない
         "check_cache": False,     # 確認の結果を、データのフォルダに保存して、次回から読むだけにする（M9）
         "shuffle_warm": 0,        # 0 は従来どおり（バッファを満たしてから学習）。>0 なら、この件数から学習を始める
     },
@@ -150,6 +151,8 @@ def validate(cfg):
     if d["check_mode"] not in ("sample", "probe", "full"):
         raise ValueError('data.check_mode は "sample"・"probe"・"full" のどれか')
     _check_min(d, "probe_records", 3)
+    if not isinstance(d["check_threads"], int) or d["check_threads"] < 1:
+        raise ValueError("data.check_threads は 1 以上の整数")
     if not isinstance(d["probe_files"], int) or d["probe_files"] < 0:
         raise ValueError("data.probe_files は 0 以上の整数（0 なら全ファイル）")
     if not isinstance(d["shuffle_warm"], int) or not 0 <= d["shuffle_warm"] <= d["shuffle_buffer"]:
@@ -214,11 +217,42 @@ def train_paths(d):
 
 # ---------- 部品 ----------
 
-def sample_scale_positions(paths, limit, seed, out_path):
+def read_file_blocks(path, spans):
+    """1 ファイルから、(開始の局面番号, 局面数) の区間を順に読む（開く・位置を移す・読む）。M9.2 の並列の 1 単位。"""
+    out = []
+    with open(path, "rb") as f:
+        for st, ln in spans:
+            f.seek(st * PSV_BYTES)
+            out.append(f.read(ln * PSV_BYTES))
+    return out
+
+
+def read_parallel(jobs, threads, consume):
+    """jobs = [(path, spans), ...] を、threads 本で並列に読む。結果は元の順番で consume(path, blocks) へ渡す。
+
+    塊（threads × 4 件）ごとに読んで渡すので、メモリは塊の大きさに抑えられる。
+    threads = 1 なら並列を使わない（従来どおり）。読みの順番が変わっても、渡す順番は変わらない。
+    """
+    if threads <= 1:
+        for path, spans in jobs:
+            consume(path, read_file_blocks(path, spans))
+        return
+    from concurrent.futures import ThreadPoolExecutor
+    chunk = threads * 4
+    with ThreadPoolExecutor(max_workers=threads) as ex:
+        for i in range(0, len(jobs), chunk):
+            part = jobs[i:i + chunk]
+            futures = [ex.submit(read_file_blocks, p, sp) for p, sp in part]
+            for (p, _), fu in zip(part, futures):
+                consume(p, fu.result())
+
+
+def sample_scale_positions(paths, limit, seed, out_path, threads=1):
     """勝敗の確認と eval_scale の推定に使う局面を取り出す（§S4）。
 
     全ファイルから、ファイルの大きさに比例した数の「ランダムな位置の連続ブロック」を取る。
     局面数が limit 以下なら全部使う（ファイルをそのまま渡す）。
+    位置は seed から順に決める（並列にしても、取る局面の集合は同じ。M9.2）。読みだけを threads 本で並列にする。
     返り値：(使うファイルのリスト, 局面数)。抜き出したときは out_path に書く。
     """
     sizes = [os.path.getsize(p) // PSV_BYTES for p in paths]
@@ -227,30 +261,31 @@ def sample_scale_positions(paths, limit, seed, out_path):
         return list(paths), total
     rng = np.random.default_rng(seed)
     count = 0
+    jobs = []
+    for p, n in zip(paths, sizes):
+        quota = limit * n // total
+        if quota == 0:
+            continue
+        nb = -(-quota // SCALE_BLOCK)  # ブロック数（切り上げ）
+        lens = [quota // nb] * nb
+        lens[-1] += quota - sum(lens)
+        spans = []
+        for ln in lens:
+            spans.append((int(rng.integers(0, n - ln + 1)), ln))
+            count += ln
+        jobs.append((p, spans))
     with open(out_path, "wb") as out:
-        for p, n in zip(paths, sizes):
-            quota = limit * n // total
-            if quota == 0:
-                continue
-            nb = -(-quota // SCALE_BLOCK)  # ブロック数（切り上げ）
-            lens = [quota // nb] * nb
-            lens[-1] += quota - sum(lens)
-            with open(p, "rb") as f:
-                for ln in lens:
-                    start = int(rng.integers(0, n - ln + 1))
-                    f.seek(start * PSV_BYTES)
-                    out.write(f.read(ln * PSV_BYTES))
-                    count += ln
+        read_parallel(jobs, threads, lambda p, blocks: [out.write(b) for b in blocks])
     return [out_path], count
 
 
-def probe_positions(paths, per_file, out_path, max_files=0, seed=0):
+def probe_positions(paths, per_file, out_path, max_files=0, seed=0, threads=1):
     """抜き取り（data.check_mode = "probe"，M9）：各ファイルの先頭・中央・末尾から per_file/3 件ずつ読む。
 
     ファイルの大きさは全ファイルについて先に検査する（stat だけ。40 の倍数でなければ止める）。
     max_files > 0 なら、seed で決まる無作為な max_files 個のファイルだけを読む（読む回数を抑える）。
-    勝敗が 1・0・−1 でない局面は飛ばして数える。返り値：(使うファイルのリスト, 局面数, 飛ばした数)。
-    局面は out_path に書く（ローカル）。
+    勝敗が 1・0・−1 でない局面は飛ばして数える。読みは threads 本で並列（M9.2）。
+    返り値：(使うファイルのリスト, 局面数, 飛ばした数)。局面は out_path に書く（ローカル）。
     """
     n_of = {}
     for p in paths:
@@ -263,24 +298,29 @@ def probe_positions(paths, per_file, out_path, max_files=0, seed=0):
         pick = sorted(random.Random(seed).sample(range(len(read_paths)), max_files))
         read_paths = [read_paths[i] for i in pick]
     per_block = max(1, per_file // 3)
-    count = skipped = 0
+    jobs = []
+    for p in read_paths:
+        n = n_of[p]
+        if n == 0:
+            continue
+        length = min(per_block, n)
+        starts = sorted({0, (n - length) // 2, n - length})
+        jobs.append((p, [(st, length) for st in starts]))
+    stats = {"count": 0, "skipped": 0}
+
+    def keep_valid(_path, blocks):
+        for b in blocks:
+            buf = np.frombuffer(b, dtype=np.uint8).reshape(-1, PSV_BYTES)
+            res = buf[:, 38].astype(np.int8)
+            ok = (res >= -1) & (res <= 1)
+            kept = buf[ok]
+            out.write(kept.tobytes())
+            stats["count"] += len(kept)
+            stats["skipped"] += len(buf) - len(kept)
+
     with open(out_path, "wb") as out:
-        for p in read_paths:
-            n = n_of[p]
-            if n == 0:
-                continue
-            length = min(per_block, n)
-            starts = sorted({0, (n - length) // 2, n - length})
-            with open(p, "rb") as f:
-                for st in starts:
-                    f.seek(st * PSV_BYTES)
-                    buf = np.frombuffer(f.read(length * PSV_BYTES), dtype=np.uint8).reshape(-1, PSV_BYTES)
-                    res = buf[:, 38].astype(np.int8)
-                    keep = buf[(res >= -1) & (res <= 1)]
-                    out.write(keep.tobytes())
-                    count += len(keep)
-                    skipped += len(buf) - len(keep)
-    return [out_path], count, skipped
+        read_parallel(jobs, threads, keep_valid)
+    return [out_path], stats["count"], stats["skipped"]
 
 
 CHECK_CACHE_NAME = "shikibu_check_cache.json"  # データのフォルダに置く（*.psv には当たらない名前）
@@ -557,6 +597,7 @@ class Trainer:
         self.scale_used = None  # 勝敗の確認と推定に使った局面数（新規の学習でだけ決まる）
         self.timing = {}        # 開始前の段階の時間（秒）。startup の行に書く（M9）
         self.cache_state = "off"  # 確認の結果のキャッシュ："off"・"hit"・"miss"
+        self.cache_saved = None   # キャッシュを書けたか（書こうとしたときだけ True/False）
         self.lazy = t["ft_optimizer"] == "lazy_adam"
 
         ck = None
@@ -651,11 +692,13 @@ class Trainer:
             return list(self.paths), total  # 全件を読む（psv_stats）。時間は全データの大きさに比例する
         if mode == "probe":
             files, count, skipped = probe_positions(self.paths, d["probe_records"], sample_path,
-                                                    max_files=d["probe_files"], seed=t["seed"])
+                                                    max_files=d["probe_files"], seed=t["seed"],
+                                                    threads=d["check_threads"])
             if skipped:
                 print(f"抜き取りで、勝敗が 1・0・−1 でない局面を {skipped} 件飛ばした", flush=True)
             return files, count
-        return sample_scale_positions(self.paths, t["scale_sample"], t["seed"], sample_path)
+        return sample_scale_positions(self.paths, t["scale_sample"], t["seed"], sample_path,
+                                      threads=d["check_threads"])
 
     def _decide_eval_scale(self):
         """勝敗の欠損を確かめ、eval_scale を決める（§S4）。確認は check_mode の抜き取りで行う。
@@ -694,8 +737,8 @@ class Trainer:
                 est = float(shikibu_feat.estimate_eval_scale(files, sample=min(count, t["scale_sample"]),
                                                              seed=t["seed"])["eval_scale"])
             if cache_path is not None:
-                write_check_cache(cache_path, key, {"count": count, "result_missing": missing,
-                                                    "eval_scale": est, "saved": time.time()})
+                self.cache_saved = write_check_cache(cache_path, key, {"count": count, "result_missing": missing,
+                                                                       "eval_scale": est, "saved": time.time()})
             if setting is not None:
                 return setting, "config"
             return est, "auto"
@@ -850,7 +893,8 @@ class Trainer:
             self.pending = self._fetch()  # shuffle_warm > 0 のときは、少ない件数から始める（M9）
         self.timing["first_batch"] = time.monotonic() - t_fill
         self.log.write({"type": "startup", "seconds": {k: round(v, 3) for k, v in self.timing.items()},
-                        "cache": self.cache_state, "check_mode": self.d["check_mode"],
+                        "cache": self.cache_state, "cache_saved": self.cache_saved,
+                        "check_threads": self.d["check_threads"], "check_mode": self.d["check_mode"],
                         "scale_positions_used": self.scale_used, "shuffle_warm": self.d["shuffle_warm"],
                         "ft_forward": t["ft_forward"], "ft_grad": t["ft_grad"],
                         "ft_optimizer": t["ft_optimizer"], "fast": t["fast"]})

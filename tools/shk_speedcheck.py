@@ -41,6 +41,7 @@ def main():
     ap.add_argument("--cache-dir", default="", help="F3・F4 の先読み先（学習の cache_dir と同じ場所。空なら使わない）")
     ap.add_argument("--skip-startup", action="store_true", help="F（開始前の待ち時間）を測らない")
     ap.add_argument("--skip-profile", action="store_true", help="P（時間の内訳）を測らない")
+    ap.add_argument("--check-threads", type=int, default=16, help="F1・F2 の読みを並列に行う本数（学習の check_threads と同じ）")
     args = ap.parse_args()
     sys.path.insert(0, os.path.join(args.repo, "python"))
 
@@ -265,13 +266,13 @@ def main():
 
     def row_f1():
         t = time.perf_counter()
-        files, count = train.sample_scale_positions(all_paths, 10_000_000, 0, tmp)
+        files, count = train.sample_scale_positions(all_paths, 10_000_000, 0, tmp, threads=args.check_threads)
         t_pick = time.perf_counter() - t
         t = time.perf_counter()
         shikibu_feat.psv_stats(files)
         shikibu_feat.estimate_eval_scale(files, sample=count, seed=0)
         t_stat = time.perf_counter() - t
-        print(f"F1 データの確認（sample・既定）: 抜き出し {t_pick:6.1f} 秒 ＋ 統計・推定 {t_stat:6.1f} 秒（局面 {count:,}）",
+        print(f"F1 データの確認（sample・既定・並列 {args.check_threads}）: 抜き出し {t_pick:6.1f} 秒 ＋ 統計・推定 {t_stat:6.1f} 秒（局面 {count:,}）",
               flush=True)
         if files != all_paths and os.path.exists(tmp):
             os.remove(tmp)
@@ -279,13 +280,13 @@ def main():
 
     def row_f2():
         t = time.perf_counter()
-        files, count, skipped = train.probe_positions(all_paths, 3000, tmp)
+        files, count, skipped = train.probe_positions(all_paths, 3000, tmp, threads=args.check_threads)
         t_pick = time.perf_counter() - t
         t = time.perf_counter()
         shikibu_feat.psv_stats(files)
         shikibu_feat.estimate_eval_scale(files, sample=count, seed=0)
         t_stat = time.perf_counter() - t
-        print(f"F2 データの確認（probe）      : 抜き出し {t_pick:6.1f} 秒 ＋ 統計・推定 {t_stat:6.1f} 秒（局面 {count:,}、飛ばし {skipped:,}）",
+        print(f"F2 データの確認（probe・並列 {args.check_threads}）: 抜き出し {t_pick:6.1f} 秒 ＋ 統計・推定 {t_stat:6.1f} 秒（局面 {count:,}、飛ばし {skipped:,}）",
               flush=True)
         if os.path.exists(tmp):
             os.remove(tmp)

@@ -24,6 +24,8 @@
 | `check_mode` | 文字列 | `"sample"` | 開始前の勝敗の確認に使う局面。`"sample"`（従来。`scale_sample` 以下の抜き出し）・`"probe"`（各ファイルの先頭・中央・末尾から `probe_records` 件ずつ。ファイルの大きさを先に検査する）・`"full"`（**全件**を読む。時間は全データに比例。数時間かかりうる）。M9 | M9（§S4） |
 | `probe_records` | 整数 | `3000` | `check_mode = "probe"` のとき、1 ファイルから読む局面数（3 ブロックに分ける）。3 以上 | M9 |
 | `check_cache` | 真偽値 | `false` | `true` なら、勝敗の確認と eval_scale の推定の結果を、データのフォルダの `shikibu_check_cache.json` に保存し、同じデータ（ファイルの名前・大きさ・更新時刻）と同じ確認の設定なら、次回から読むだけにする。変わったら作り直す。書けなくても学習は続ける | M9 |
+| `probe_files` | 整数 | `0` | `check_mode = "probe"` のとき、読むファイル数の上限（0 なら全ファイル）。無作為に選ぶ（`seed` で決まる）。読む回数は約 3 × この数。M9 | M9 |
+| `check_threads` | 整数 | `16` | 開始前の確認（sample・probe）で、ファイルを読む並列の本数。1 なら並列なし。取る局面の集合と順番は並列数に依らない（同じ結果）。Drive のように 1 回の読みが遅いときに効く。M9.2 | M9.2 |
 | `shuffle_warm` | 整数 | `0` | 0 なら従来どおり（シャッフルバッファを満たしてから学習を始める）。`shuffle_buffer` 以下の値なら、その件数から学習を始め、バッチを出すたびに `batch_size` ずつバッファを増やして `shuffle_buffer` まで広げる（待ち時間の短縮）。学習の初めの数百ステップの並びが変わる | M9 |
 - `train_glob` も `train_paths` も空だと、`ValueError`（「data.train_paths か data.train_glob を指定する」）。
 - `train_glob` に当たるファイルが1つも無いと、`ValueError`（「学習データが1つも無い」）。

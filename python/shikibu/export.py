@@ -156,20 +156,66 @@ def nnbin_support(arch):
     p = networks.parse_arch(arch)
     if p["feature"] not in nnbin.FEATURES:
         return f"nn.bin（やねうら王の形式）に書き出せるのは halfk… の特徴だけ（{p['feature']} は書き出せない）"
+    if p["sfnn"]:
+        return None  # M10：SFNN（レイヤースタックつき）は k3k3 も含めて書き出せる
     if p["psqt"] or p["stacks"] != 1:
         return "psqt・k3k3 の構造は、まだ書き出せない（学習と val_loss の比較だけできる）"
     return None
 
 
 def yo_arch(arch):
-    """やねうら王の構造の名前（例 halfkahm2_512x2-16-32）。"""
+    """やねうら王の構造の名前（例 halfkahm2_512x2-16-32。SFNN は SFNN_halfkahm2_512_15_32_k3k3）。"""
     p = networks.parse_arch(arch)
+    if p["sfnn"]:
+        return f"SFNN_{p['feature']}_{p['W']}_{p['H1']}_{p['H2']}" + ("_k3k3" if p["stacks"] == 9 else "")
     return f"{p['feature']}_{p['W']}x2-{p['L1']}-{p['L2']}"
 
 
 def yo_edition(arch):
-    """やねうら王のビルドの YANEURAOU_EDITION に入れる名前（例 YANEURAOU_ENGINE_NNUE_HALFKAHM2_512X2_16_32）。"""
+    """やねうら王のビルドの YANEURAOU_EDITION に入れる名前。
+    従来は YANEURAOU_ENGINE_NNUE_HALFKAHM2_512X2_16_32、SFNN は YANEURAOU_ENGINE_SFNN_halfkahm2_512_15_32_k3k3（M10）。"""
+    if networks.parse_arch(arch)["sfnn"]:
+        return "YANEURAOU_ENGINE_" + yo_arch(arch)
     return "YANEURAOU_ENGINE_NNUE_" + yo_arch(arch).upper().replace("-", "_")
+
+
+def _export_sfnn(ck, m, arch, p, es, fv_scale, out_path):
+    """SFNN の nn.bin を書き、読み直して確かめる（§M10。ファイルの並びは tests/sfnn_ref.py）。
+    FT は ×127 で int16（因数分解は畳む）。層は ×8128（バイアス）・×64（重み）。近道の行と fc_2 は s 倍。
+    ファイルのスタック j には、Shikibu のバケツ 8 − j（k3k3 なし＝ j = 0）の重みを書く。"""
+    feature, W, H1, H2, S = p["feature"], p["W"], p["H1"], p["H2"], p["stacks"]
+    O0 = nnbin.sfnn_out_dims(H1)
+    s = es * fv_scale / FV_NUMER
+    t = {k: v.double().numpy() for k, v in m.export_tensors().items()}
+    w = t["ft_weight"]
+    if p["factorize"]:
+        nf = nnbin.num_features(feature)  # 因数分解つき：玉の位置に関係ない特徴を、各玉の位置の特徴へ足す
+        w = w[:nf] + np.tile(w[nf:], (nnbin.FEATURES[feature][3], 1))
+    r = np.ones(O0)  # fc_0 の行の倍率（近道の行は s）
+    if p["shortcut"]:
+        r[H1] = s
+    q = {"ft_b": _quant(t["ft_bias"], W_FT_SCALE, np.int16), "ft_w": _quant(w, W_FT_SCALE, np.int16)}
+    for k in ("b0", "w0", "b1", "w1", "b2", "w2"):
+        q[k] = []
+    for j in range(S):
+        i = 8 - j if S == 9 else 0  # やねうら王のバケツ j ＝ Shikibu のバケツ 8 − j
+        q["b0"].append(_quant(t["l0_bias"][i] * r, B_SCALE, np.int32))
+        q["w0"].append(_quant(t["l0_weight"][i] * r[:, None], W_L_SCALE, np.int8))
+        q["b1"].append(_quant(t["l1_bias"][i], B_SCALE, np.int32))
+        q["w1"].append(_quant(t["l1_weight"][i], W_L_SCALE, np.int8))
+        q["b2"].append(_quant(t["l2_bias"][i] * s, B_SCALE, np.int32))
+        q["w2"].append(_quant(t["l2_weight"][i] * s, W_L_SCALE, np.int8))
+    for k in ("b0", "w0", "b1", "w1", "b2", "w2"):
+        q[k] = np.stack(q[k])
+    yo = yo_arch(arch)
+    nnbin.write_sfnn(out_path, yo, feature, W, H1, H2, S, q)
+
+    back = nnbin.read_sfnn(out_path, yo, feature, W, H1, H2, S)
+    for k, v in q.items():
+        if not np.array_equal(back[k].reshape(v.shape), v):
+            raise ValueError(f"書き出しの確認に失敗（{k}）")
+    return {"network": ck["network"], "arch": yo, "eval_scale": es, "fv_scale": fv_scale,
+            "stacks": S, "yo_edition": yo_edition(arch)}
 
 
 def export_nnbin(checkpoint_path, out_path, fv_scale=None):
@@ -181,7 +227,7 @@ def export_nnbin(checkpoint_path, out_path, fv_scale=None):
     if why:
         raise ValueError(f"この構造は nn.bin に書き出せない: {why}")
     p = networks.parse_arch(arch)
-    feature, W, L1, L2 = p["feature"], p["W"], p["L1"], p["L2"]
+    feature, W = p["feature"], p["W"]
     es = float(ck["eval_scale"])
     if fv_scale is None:
         fv_scale = max(1, math.floor(FV_NUMER / es))
@@ -190,6 +236,9 @@ def export_nnbin(checkpoint_path, out_path, fv_scale=None):
     s = es * fv_scale / FV_NUMER
     if s > 1:
         raise ValueError(f"FV_SCALE が大きすぎる（s = {s:.3f} > 1 になると、出力が範囲を超える）")
+    if p["sfnn"]:
+        return _export_sfnn(ck, m, arch, p, es, fv_scale, out_path)
+    L1, L2 = p["L1"], p["L2"]
 
     t = {k: v.double().numpy() for k, v in m.export_tensors().items()}
     w = t["ft_weight"]

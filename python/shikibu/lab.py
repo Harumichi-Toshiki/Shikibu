@@ -26,6 +26,7 @@ PRESETS = {
     "halfkahm2_1024x2-8-32_f": "HalfKA_hm2 の幅 1024（重いが正確。nn.bin に書ける）",
     "halfkahm2_512x2-16-32_f_psqt": "HalfKA_hm2 ＋ 駒の点数の直接の項（独自。まだ書き出せない）",
     "halfkahm2_512x2-16-32_f_k3k3": "HalfKA_hm2 ＋ 玉の段で層を切り替える（独自。まだ書き出せない）",
+    "sfnn_halfkahm2_512-15-32_f_k3k3": "SFNN（やねうら王の SFNN と同じ構造。層を 9 組持つ。nn.bin に書ける）",
 }
 
 # 特徴ごとの 1 局面 1 視点の特徴の最大数（推論のとき 1 回に入る要素の上限の目安）
@@ -35,11 +36,19 @@ MAX_ACTIVE = {"halfkp": 38, "raypair0": 208, "raypair1": 208, "raypair0k": 256, 
 def describe(name):
     """構造の性質を dict で返す。キー：canonical, feature, W, L1, L2, train_features（学習のときの次元）,
     infer_features（因数分解を畳んだ後）, params（学習する重みの数）, max_active, export_format（"nn.bin" / ".shk" / None）,
-    yo_compatible, yo_arch, yo_edition, nnbin_bytes。"""
+    yo_compatible, yo_arch, yo_edition, nnbin_bytes。
+    SFNN（M10）は L1 に H1（fc_0 の出力）、L2 に H2 を入れる。nnbin_bytes は SFNN では None（LEB128 の大きさは重みの値で決まる）。"""
     p = networks.parse_arch(name)
-    feat, W, L1, L2, S = p["feature"], p["W"], p["L1"], p["L2"], p["stacks"]
+    feat, W, S = p["feature"], p["W"], p["stacks"]
     infer = networks.FEATURES[feat][2]
-    params = p["num_features"] * W + W + S * (L1 * 2 * W + L1 + L2 * L1 + L2 + L2 + 1)
+    if p["sfnn"]:
+        L1, L2 = p["H1"], p["H2"]
+        O0 = L1 + (1 if p["shortcut"] else 0)
+        layers = O0 * W + O0 + L2 * 2 * L1 + L2 + L2 + 1
+    else:
+        L1, L2 = p["L1"], p["L2"]
+        layers = L1 * 2 * W + L1 + L2 * L1 + L2 + L2 + 1
+    params = p["num_features"] * W + W + S * layers
     if p["psqt"]:
         params += p["num_features"] * S
     why = export.nnbin_support(p["canonical"])
@@ -55,7 +64,7 @@ def describe(name):
             "max_active": MAX_ACTIVE.get(feat, 40), "export_format": fmt, "yo_compatible": yo,
             "yo_arch": export.yo_arch(name) if yo else None,
             "yo_edition": export.yo_edition(name) if yo else None,
-            "nnbin_bytes": nnbin.file_size(feat, W, L1, L2) if yo else None}
+            "nnbin_bytes": None if p["sfnn"] or not yo else nnbin.file_size(feat, W, L1, L2)}
 
 
 def make_config(name, train_glob, out_dir, val_path="", overrides=None):

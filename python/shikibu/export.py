@@ -213,17 +213,65 @@ def export_nnbin(checkpoint_path, out_path, fv_scale=None):
             "yo_edition": yo_edition(arch)}
 
 
+def export_k3k3_nnbin(checkpoint_path, out_path, fv_scale=None):
+    """checkpoint.pt から k3k3（9 組レイヤースタック）の量子化済みバイナリを書き出し、読み直して確かめる。
+    対象は halfk… で psqt なし・k3k3 ありの構造。"""
+    ck, m, arch = _load(checkpoint_path)
+    p = networks.parse_arch(arch)
+    if p["feature"] not in nnbin.FEATURES:
+        raise ValueError(f"k3k3 nn.bin に書き出せるのは halfk… の特徴だけ（{p['feature']}）")
+    if p["psqt"]:
+        raise ValueError("psqt つきの構造は、まだ k3k3 nn.bin に書き出せない")
+    if p["stacks"] != nnbin.K3K3_STACKS:
+        raise ValueError(f"k3k3 の構造ではない（stacks={p['stacks']}）: {arch}")
+    feature, W, L1, L2, S = p["feature"], p["W"], p["L1"], p["L2"], p["stacks"]
+    es = float(ck["eval_scale"])
+    if fv_scale is None:
+        fv_scale = max(1, math.floor(FV_NUMER / es))
+    if fv_scale < 1:
+        raise ValueError(f"FV_SCALE は1以上: {fv_scale}")
+    s = es * fv_scale / FV_NUMER
+    if s > 1:
+        raise ValueError(f"FV_SCALE が大きすぎる（s = {s:.3f} > 1 になると、出力が範囲を超える）")
+
+    t = {k: v.double().numpy() for k, v in m.export_tensors().items()}
+    w = t["ft_weight"]
+    if p["factorize"]:
+        n_half = nnbin.num_features(feature)
+        w = w[:n_half] + np.tile(w[n_half:], (nnbin.FEATURES[feature][3], 1))
+    q = {"ft_b": _quant(t["ft_bias"], W_FT_SCALE, np.int16), "ft_w": _quant(w, W_FT_SCALE, np.int16),
+         "b1": _quant(t["l1_bias"], B_SCALE, np.int32), "w1": _quant(t["l1_weight"], W_L_SCALE, np.int8),
+         "b2": _quant(t["l2_bias"], B_SCALE, np.int32), "w2": _quant(t["l2_weight"], W_L_SCALE, np.int8),
+         "bo": _quant(t["out_bias"] * s, B_SCALE, np.int32),
+         "wo": _quant(t["out_weight"].reshape(S, 1, L2) * s, W_L_SCALE, np.int8)}
+    nnbin.write_k3k3(out_path, feature, W, L1, L2, q, stacks=S)
+
+    back = nnbin.read_k3k3(out_path, feature, W, L1, L2, stacks=S)
+    for k, v in q.items():
+        if not np.array_equal(back[k].reshape(v.shape), v):
+            raise ValueError(f"k3k3 書き出しの確認に失敗（{k}）")
+    return {"network": ck["network"], "arch": f"{yo_arch(arch)}_k3k3", "stacks": S,
+            "eval_scale": es, "fv_scale": fv_scale, "yo_edition": yo_edition(arch)}
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="python -m shikibu.export")
     p.add_argument("--checkpoint", required=True, help="学習の checkpoint.pt")
     p.add_argument("--out", required=True, help="書き出すファイル（raypair は .shk、halfk… は nn.bin）")
     p.add_argument("--fv-scale", type=int, default=None,
                    help="nn.bin の FV_SCALE を指定する（省略時は floor(8128 / eval_scale)）")
+    p.add_argument("--k3k3", action="store_true",
+                   help="k3k3（9 組レイヤースタック）の halfk… 構造を 9 組 nn.bin 形式で書き出す")
     args = p.parse_args(sys.argv[1:] if argv is None else argv)
     try:
-        if networks.parse_arch(arch_of_checkpoint(args.checkpoint))["feature"] in nnbin.FEATURES:
-            h = export_nnbin(args.checkpoint, args.out, args.fv_scale)
-            print(f"書き出しました（nn.bin）: {args.out}")
+        parsed = networks.parse_arch(arch_of_checkpoint(args.checkpoint))
+        if parsed["feature"] in nnbin.FEATURES:
+            if args.k3k3 and parsed["stacks"] == nnbin.K3K3_STACKS:
+                h = export_k3k3_nnbin(args.checkpoint, args.out, args.fv_scale)
+                print(f"書き出しました（k3k3 nn.bin / {h['stacks']} stacks）: {args.out}")
+            else:
+                h = export_nnbin(args.checkpoint, args.out, args.fv_scale)
+                print(f"書き出しました（nn.bin）: {args.out}")
             print(f"  network: {h['network']}")
             print(f"  arch: {h['arch']}")
             print(f"  eval_scale: {h['eval_scale']}")

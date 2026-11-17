@@ -141,3 +141,102 @@ def read(path, feature, W, L1, L2):
     if off != len(data):
         raise ValueError(f"nn.bin の長さが合わない（{off} / {len(data)}）")
     return out
+
+
+# ---------------------------------------------------------------- k3k3（9 組レイヤースタック）
+
+K3K3_STACKS = 9
+
+
+def arch_string_k3k3(feature, W, L1, L2, stacks=K3K3_STACKS):
+    """9 組レイヤースタック用の構造文字列。"""
+    name = FEATURES[feature][0]
+    n = 2 * W
+    st = f"InputSlice[{n}(0:{n})]"
+    st = f"AffineTransformSparseInput[{L1}<-{n}]({st})"
+    st = f"ClippedReLU[{L1}]({st})"
+    st = f"AffineTransform[{L2}<-{L1}]({st})"
+    st = f"ClippedReLU[{L2}]({st})"
+    st = f"AffineTransform[1<-{L2}]({st})"
+    return f"Features={name}[{num_features(feature)}->{W}x2],Network=LayerStacks[{stacks}]({st})"
+
+
+def hashes_k3k3(feature, W, L1, L2, stacks=K3K3_STACKS):
+    """(特徴変換のハッシュ, ネットワークのハッシュ, ファイルのハッシュ)（k3k3 用）。"""
+    ft, net, _ = hashes(feature, W, L1, L2)
+    net_k3k3 = (net ^ (0x4B334B33 + stacks)) & U32
+    return ft, net_k3k3, ft ^ net_k3k3
+
+
+def write_k3k3(path, feature, W, L1, L2, q, stacks=K3K3_STACKS):
+    """量子化済みの 9 組レイヤースタック配列から k3k3 nn.bin を書く。
+    q は ft_b (W,) int16、ft_w (次元, W) int16、b1 (S, L1) int32、w1 (S, L1, 2W) int8、
+    b2 (S, L2) int32、w2 (S, L2, L1) int8、bo (S, 1) int32、wo (S, 1, L2) int8。"""
+    ft_hash, net_hash, file_hash = hashes_k3k3(feature, W, L1, L2, stacks)
+    arch = arch_string_k3k3(feature, W, L1, L2, stacks).encode()
+    with open(path, "wb") as f:
+        f.write(struct.pack("<III", VERSION, file_hash, len(arch)))
+        f.write(arch)
+        f.write(struct.pack("<I", ft_hash))
+        f.write(np.ascontiguousarray(q["ft_b"], dtype="<i2").tobytes())
+        f.write(np.ascontiguousarray(q["ft_w"], dtype="<i2").tobytes())
+        f.write(struct.pack("<I", net_hash))
+        for s in range(stacks):
+            f.write(np.ascontiguousarray(q["b1"][s], dtype="<i4").tobytes())
+            f.write(_padded(q["w1"][s], pad32(2 * W)))
+            f.write(np.ascontiguousarray(q["b2"][s], dtype="<i4").tobytes())
+            f.write(_padded(q["w2"][s], pad32(L1)))
+            f.write(np.ascontiguousarray(q["bo"][s], dtype="<i4").tobytes())
+            f.write(_padded(q["wo"][s], pad32(L2)))
+
+
+def read_k3k3(path, feature, W, L1, L2, stacks=K3K3_STACKS):
+    """k3k3 nn.bin を読んで、ヘッダとハッシュを確かめたうえで配列の dict を返す。"""
+    with open(path, "rb") as f:
+        data = f.read()
+    ver, file_hash, n = struct.unpack_from("<III", data, 0)
+    if ver != VERSION:
+        raise ValueError(f"nn.bin の版が違う: {ver:#x}")
+    arch = arch_string_k3k3(feature, W, L1, L2, stacks)
+    if data[12:12 + n].decode() != arch:
+        raise ValueError("k3k3 nn.bin の構造の文字列が違う")
+    ft_hash, net_hash, want_file_hash = hashes_k3k3(feature, W, L1, L2, stacks)
+    if file_hash != want_file_hash:
+        raise ValueError("k3k3 nn.bin のファイルのハッシュが違う")
+    off = 12 + n
+    if struct.unpack_from("<I", data, off)[0] != ft_hash:
+        raise ValueError("k3k3 nn.bin の特徴変換のハッシュが違う")
+    off += 4
+
+    def take(dt, shape, cols=None):
+        nonlocal off
+        rows = shape[0]
+        width = shape[1] if len(shape) > 1 else 1
+        full = pad32(width) if cols is not None else width
+        cnt = rows * full
+        a = np.frombuffer(data, dt, cnt, off).reshape(rows, full)[:, :width]
+        off += cnt * np.dtype(dt).itemsize
+        return a.reshape(shape)
+
+    out = {"ft_b": take("<i2", (W,)), "ft_w": take("<i2", (num_features(feature), W))}
+    if struct.unpack_from("<I", data, off)[0] != net_hash:
+        raise ValueError("k3k3 nn.bin のネットワークのハッシュが違う")
+    off += 4
+    b1s, w1s, b2s, w2s, bos, wos = [], [], [], [], [], []
+    for _ in range(stacks):
+        b1s.append(take("<i4", (L1,)))
+        w1s.append(take("i1", (L1, 2 * W), cols=True))
+        b2s.append(take("<i4", (L2,)))
+        w2s.append(take("i1", (L2, L1), cols=True))
+        bos.append(take("<i4", (1,)))
+        wos.append(take("i1", (1, L2), cols=True))
+    out["b1"] = np.stack(b1s)
+    out["w1"] = np.stack(w1s)
+    out["b2"] = np.stack(b2s)
+    out["w2"] = np.stack(w2s)
+    out["bo"] = np.stack(bos)
+    out["wo"] = np.stack(wos)
+    if off != len(data):
+        raise ValueError(f"k3k3 nn.bin の長さが合わない（{off} / {len(data)}）")
+    return out
+

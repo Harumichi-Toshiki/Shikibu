@@ -3,6 +3,12 @@
 すべて設定（TOML）のオプションです。**既定の値は今の動作のまま**なので、何もしなければ今までどおり動きます。
 持ち主が Colab の GPU で速さと損失を確かめてから、既定を変えてください。
 
+> **注意（L4 の測定値・M9.1）：M9 の第1層のオプションは、L4 では既定より遅かった。使わないこと。**
+> HalfKP 256（因数分解なし）：既定 E0 157.5 万局面/秒、順伝播 sparse（E1）157.3、順伝播・勾配 sparse＋遅延型（E2）52.4、遅延型のみ（E3）119.6、E2＋bf16（E4）52.1。
+> HalfKA_hm 512（因数分解つき）：既定 84.4 万局面/秒、順伝播 sparse（E1）44.5（その後の E2 はメモリ不足で失敗）。
+> bf16（`fast`）は効かなかった（2 層目以降の計算は時間の一部）。`ft_forward`・`ft_grad`・`ft_optimizer = "lazy_adam"` は、既定のまま（`dense`・`adamw`）で使うこと。
+> 第1層の専用カーネル（`ft_kernel = "triton"`、M9.1）は、既定より速いかどうかを E5 の行で確かめる（REPORT_M91.md）。
+
 ## 1. オプション一覧
 
 | 設定 | 既定 | 何をするか |
@@ -15,6 +21,7 @@
 | `train.ft_forward` | `"dense"` | 第1層の順伝播。`"sparse"` は有効な行だけを足す（因数分解つきでも W_eff を作らない） |
 | `train.ft_grad` | `"dense"` | 第1層の勾配。`"sparse"` は疎な勾配（`ft_optimizer = "lazy_adam"` が必要） |
 | `train.ft_optimizer` | `"adamw"` | `"lazy_adam"` は第1層の重みだけ、使った行だけを更新する Adam（下の注意を読むこと） |
+| `train.ft_kernel` | `"torch"` | 第1層の計算。`"triton"`（M9.1）は専用カーネル。`ft_forward`・`ft_grad` は `"dense"` のみ。GPU が無いときは解釈モード（環境変数 `TRITON_INTERPRET=1`）でだけ動く（遅い） |
 | `train.fast` | `false` | CUDA のとき、2 層目以降を bf16 の自動混合精度で計算する（CPU では無視） |
 
 設定の検査は学習の前に行われ、組み合わせが不正なら止まります（例：`ft_grad = "sparse"` は `ft_optimizer = "lazy_adam"` が必要。因数分解つきの網では `ft_forward = "sparse"` も必要）。

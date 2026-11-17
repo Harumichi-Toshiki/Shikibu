@@ -88,6 +88,16 @@ def _ft_table(net, module, base):
     return _table(module, net.FEATURE_VERSION, base)
 
 
+def _ft_pair_triton(net, si, so, ni, no):
+    """FT_KERNEL = "triton" の第1層（バイアス込み）。因数分解つきなら、本体の行と共通の行を足す（M9.1）。"""
+    from shikibu import ft_triton
+    v = net.FEATURE_VERSION
+    if v in _PLANE:
+        P, nk = _PLANE[v]
+        return ft_triton.ft_pair(net, si, so, ni, no, P * nk, P, True)
+    return ft_triton.ft_pair(net, si, so, ni, no, net.NUM_FEATURES, 1, False)
+
+
 def _bag(module, table, idx, off):
     if table is None:
         return module(idx, off)
@@ -128,6 +138,7 @@ class RayPairNetwork(nn.Module):
     NEEDS_KINGS = False
     FT_FORWARD_SPARSE = False  # M9：第1層の順伝播を有効な行だけで行う（既定 False = 従来の計算）
     FT_GRAD_SPARSE = False     # M9：第1層の勾配を疎にする（オプティマイザは遅延型）
+    FT_KERNEL = "torch"        # M9.1：第1層の計算（"torch" = 従来、"triton" = ft_triton の専用カーネル）
 
     def __init__(self, ft_width=128):
         super().__init__()
@@ -147,10 +158,13 @@ class RayPairNetwork(nn.Module):
 
     def forward(self, stm_indices, stm_offsets, nstm_indices, nstm_offsets, kings=None, base=False):
         # 手番側を先に連結する（§F3.2）。kings は従来の名前では使わない
-        table = _ft_table(self, self.ft, base)
-        sp = self.FT_GRAD_SPARSE
-        a = self.ft_bias + _bag_ft(self, self.ft, table, base, stm_indices, stm_offsets, sp)
-        b = self.ft_bias + _bag_ft(self, self.ft, table, base, nstm_indices, nstm_offsets, sp)
+        if self.FT_KERNEL == "triton" and base:
+            a, b = _ft_pair_triton(self, stm_indices, stm_offsets, nstm_indices, nstm_offsets)
+        else:
+            table = _ft_table(self, self.ft, base)
+            sp = self.FT_GRAD_SPARSE
+            a = self.ft_bias + _bag_ft(self, self.ft, table, base, stm_indices, stm_offsets, sp)
+            b = self.ft_bias + _bag_ft(self, self.ft, table, base, nstm_indices, nstm_offsets, sp)
         x = torch.cat([a, b], dim=1)
         h = torch.clamp(x, 0.0, 1.0)
         h = torch.clamp(self.l1(h), 0.0, 1.0)
@@ -278,6 +292,7 @@ class ArchNetwork(nn.Module):
         self.NEEDS_KINGS = S > 1
         self.FT_FORWARD_SPARSE = False  # M9（学習の設定で変える）
         self.FT_GRAD_SPARSE = False
+        self.FT_KERNEL = "torch"
         self.ft = nn.EmbeddingBag(self.NUM_FEATURES, W, mode="sum")
         self.ft_bias = nn.Parameter(torch.zeros(W))
         nn.init.normal_(self.ft.weight, 0.0, 0.01)
@@ -320,10 +335,13 @@ class ArchNetwork(nn.Module):
 
     def forward(self, stm_indices, stm_offsets, nstm_indices, nstm_offsets, kings=None, base=False):
         v = self.FEATURE_VERSION
-        table = _ft_table(self, self.ft, base)
-        sp = self.FT_GRAD_SPARSE
-        a = self.ft_bias + _bag_ft(self, self.ft, table, base, stm_indices, stm_offsets, sp)
-        b = self.ft_bias + _bag_ft(self, self.ft, table, base, nstm_indices, nstm_offsets, sp)
+        if self.FT_KERNEL == "triton" and base:
+            a, b = _ft_pair_triton(self, stm_indices, stm_offsets, nstm_indices, nstm_offsets)
+        else:
+            table = _ft_table(self, self.ft, base)
+            sp = self.FT_GRAD_SPARSE
+            a = self.ft_bias + _bag_ft(self, self.ft, table, base, stm_indices, stm_offsets, sp)
+            b = self.ft_bias + _bag_ft(self, self.ft, table, base, nstm_indices, nstm_offsets, sp)
         h0 = torch.clamp(torch.cat([a, b], dim=1), 0.0, 1.0)
         if self.STACKS == 1:
             h = torch.clamp(self.l1(h0), 0.0, 1.0)

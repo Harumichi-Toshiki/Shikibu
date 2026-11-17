@@ -172,12 +172,14 @@ def test_startup_cache_hit_gives_same_scale_and_is_logged(tmp_path):
     assert os.path.exists(os.path.join(data_dir, train.CHECK_CACHE_NAME))
 
 
-def test_startup_default_check_is_unchanged_when_cache_off(dataset, tmp_path):
-    data_dir = os.path.dirname(dataset[0])
+def test_startup_check_is_unchanged_when_cache_off(tmp_path):
+    # check_cache = false を明示する（既定は M9.2 で true になった）。キャッシュを使わないときの動作が変わらないことを確かめる。
+    data_dir = str(tmp_path / "d")  # キャッシュのファイルを置かれないよう、このテスト専用のデータを使う
+    make_dataset(data_dir, n_files=N_FILES, per_file=PER_FILE, seed=93)
     assert not os.path.exists(os.path.join(data_dir, train.CHECK_CACHE_NAME))
     o = tmp_path / "run"
     os.makedirs(o)
-    c = _write_cfg(tmp_path / "c.toml", data_dir, o)
+    c = _write_cfg(tmp_path / "c.toml", data_dir, o, data={"check_cache": False})
     assert train.main(["--config", c]) == 0
     st = next(r for r in _log(o) if r["type"] == "startup")
     assert st["cache"] == "off" and st["check_mode"] == "sample" and st["shuffle_warm"] == 0

@@ -2,26 +2,16 @@
 
 ## 状態（先に）
 
-受け入れ条件は未達です。13 件のうち 11 件が合格、2 件が失敗しています。
+受け入れ条件を満たしました。M10 の 13 件はすべて合格です。
 
-- 失敗：`test_build_and_forward[sfnn_halfkahm2_64-7-8_k3k3]` と `test_build_and_forward[sfnn_halfka2_128-15-8_f_k3k3]`
-- 原因：テストの冒頭の確認 `assert len(buckets) >= 3` が、テスト側のデータで落ちています。
-  `random_boards(24, seed=10101)` と SPARSE の局面は、k3k3 のバケツが 0 と 1 の 2 種類しか出ません
-  （`tests/kingzone_ref.py` の `k3k3_bucket` だけで決まる値で、実装とは無関係です）。
-  cshogi 1.0.9 と 1.1.1 で同じ局面集合になることも確かめました。
-- 切り分け：テストのコピー（リポジトリの外、シードだけ 7401 に変更）では、同じ 3 件（`build_and_forward` の全件）が合格しました。
-  式との比較（`atol 1e-4`）の部分も含めて通るので、残りは「シード（または確認の条件）」の問題です。
-- 判断が必要：保護されたテストのシードを変えるかどうかは、持ち主が決めてください。
-  保護ファイル（`tests/test_m10_acceptance.py`、`tests/conftest.py`）は変更していません。
+- 以前失敗していた `test_build_and_forward` の k3k3 の 2 件（`sfnn_halfkahm2_64-7-8_k3k3`、`sfnn_halfka2_128-15-8_f_k3k3`）は、キット M10.1 でテストの局面の選び方を直したことで合格しました。
+  直したのは、正解データの局面から「バケツ × 手番」が全部そろうように局面を足したことだけです（`golden_boards()`）。実装は変えていません。
+- 以前の原因は、テスト側の局面がバケツ 0 と 1 しか含まなかったことです（`assert len(buckets) >= 3` で落ちていた）。
 
 ## テスト結果
 
-- `python -m pytest -q tests`（全件）：**2 failed, 195 passed**（1 warning は既存の M9 テストの UserWarning）
-  - 失敗は上の 2 件だけ。M1〜M9.2 は全件合格。
-- M10 の 13 件：11 合格、2 失敗（上記）。
-  - 合格：`test_reference_matches_yaneuraou`、`test_bucket_numbering`、`test_parse_arch_sfnn`、
-    `test_build_and_forward`（halfkp の 1 件）、`test_clip_sfnn`、`test_training_runs`、
-    `test_export_sfnn_exact`（2 件）、`test_exported_eval_matches_float`、`test_cli_edition`、`test_lab_describe_sfnn`
+- `python -m pytest -q tests/test_m10_acceptance.py`：**13 passed**
+- `python -m pytest -q tests`（全件）：**197 passed, 1 warning**（1 warning は既存の M9 テストの UserWarning）
 - `python check_protected.py`：**OK**
 
 ## 変えたファイル
@@ -31,8 +21,8 @@
 - `python/shikibu/export.py`：`_export_sfnn`（量子化・スタックの並び・読み直しの確認）、`nnbin_support` / `yo_arch` / `yo_edition` の SFNN 対応。従来の書き出しは変えていない。
 - `python/shikibu/lab.py`：プリセット `sfnn_halfkahm2_512-15-32_f_k3k3` の追加、`describe` の SFNN 対応（パラメータ数、yo_arch、yo_edition）。
 - `notebooks/shikibu_lab.ipynb`：比べる構造の一覧に SFNN を追加、書き出しの説明を更新（JSON の 4 行の変更だけ）。
-- `PROTECTED.sha256`・`tests/sfnn_ref.py`・`tests/test_m10_acceptance.py`・`tests/golden/sfnn_golden.json`：キットの導入（手順1）。
-- `shikibu_kit_m10.zip`：削除（キットの導入後）。
+- `PROTECTED.sha256`・`tests/sfnn_ref.py`・`tests/test_m10_acceptance.py`・`tests/golden/sfnn_golden.json`：キットの導入（M10 は手順1、M10.1 は `PROTECTED.sha256` と `tests/test_m10_acceptance.py` を更新）。
+- `shikibu_kit_m10.zip`・`shikibu_kit_m101.zip`：削除（キットの導入後）。
 - 変更なし：`train.py`（既存の `clip_weights_` が `model.clip_` を呼ぶので、SFNN にも効く）、Rust（コードは変えていない。wheel を作って入れた）。
 
 ## 数値
@@ -69,4 +59,6 @@
 - `3e16175` Add SFNN architecture name and model (M10)
 - `fe10119` Export SFNN nn.bin with layer stacks (M10)
 - `8910ec3` Add SFNN preset and Colab lab notebook option (M10)
-- 本報告のコミット（下の最終コミットを参照）
+- `e1c1b2e` Merge origin/main（M10.1 のキットの zip を取り込んだ。履歴の書き換えはなし）
+- `d493af2` Install kit M10.1
+- 本報告の最終コミット（`git log -1` で確認）

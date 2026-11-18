@@ -76,6 +76,19 @@ from shikibu import networks, train  # noqa: E402
 GOLDEN = os.path.join(HERE, "golden", "sfnn_golden.json")
 
 
+def golden_boards():
+    """正解データの局面から、バケツ × 手番が全部そろうように 1 局面ずつ選ぶ（玉の段がばらけた局面）。"""
+    g = json.load(open(GOLDEN, encoding="utf-8"))
+    picked, out = set(), []
+    for c in g["files"][0]["cases"]:
+        b = cshogi.Board(c["sfen"])
+        key = (c["bucket"], b.turn)
+        if key not in picked:
+            picked.add(key)
+            out.append(b)
+    return out
+
+
 # ================================================================ 参照実装（やねうら王との一致）
 
 def test_reference_matches_yaneuraou(tmp_path):
@@ -171,7 +184,7 @@ def test_build_and_forward(arch):
     m.set_from_tensors(w)
     m.eval()
     npw = {k: v.double().numpy() for k, v in w.items()}
-    boards = random_boards(24, seed=10101) + [cshogi.Board(s) for s in SPARSE]
+    boards = random_boards(24, seed=10101) + [cshogi.Board(s) for s in SPARSE] + golden_boards()
     si, so, ni, no, kings, expect, buckets = [], [], [], [], [], [], set()
     for b in boards:
         stm = 0 if b.turn == cshogi.BLACK else 1

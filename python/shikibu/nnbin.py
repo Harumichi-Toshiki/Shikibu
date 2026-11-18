@@ -141,3 +141,123 @@ def read(path, feature, W, L1, L2):
     if off != len(data):
         raise ValueError(f"nn.bin の長さが合わない（{off} / {len(data)}）")
     return out
+
+
+# ---------------------------------------------------------------- SFNN（M10）
+# ファイルの並びは tests/sfnn_ref.py（やねうら王 2bc64b4 で確かめた参照実装）。
+#   u32 版、u32 ハッシュ（SFNN_HASH）、u32 構造の文字列の長さ n、構造の文字列（読み込みでは使われない）
+#   u32 FT のハッシュ、FT のバイアス・重みの LEB128 の塊（塊 = "COMPRESSED_LEB128" ＋ u32 バイト数 ＋ 列）
+#   スタックごと：u32 ハッシュ、fc_0（バイアス int32 × O0、重み int8 × O0 × pad32(W)）、
+#                 fc_1（int32 × H2、int8 × H2 × pad32(2H1)）、fc_2（int32 × 1、int8 × 1 × pad32(H2)）
+SFNN_HASH = 0x3C203B32
+SFNN_FT_HASH = 0x5F134AB8
+SFNN_NET_HASH = 0x6333718A
+LEB128_MAGIC = b"COMPRESSED_LEB128"
+
+
+def leb128_encode(values):
+    """符号つき LEB128 の列（bytes）。tests/sfnn_ref.py の leb128_encode と同じバイト列を、numpy で作る。"""
+    v = np.asarray(values, dtype=np.int64).reshape(-1)
+    n = v.size
+    out = np.zeros((n, 5), dtype=np.uint8)
+    length = np.zeros(n, dtype=np.int64)
+    cur = v.copy()
+    alive = np.ones(n, dtype=bool)
+    for k in range(5):  # int16・int32 の値は 5 バイトまでに収まる
+        byte = cur & 0x7F
+        cur = cur >> 7
+        done = ((cur == 0) & ((byte & 0x40) == 0)) | ((cur == -1) & ((byte & 0x40) != 0))
+        out[:, k] = np.where(alive, np.where(done, byte, byte | 0x80), 0)
+        length = np.where(alive, k + 1, length)
+        alive &= ~done
+    if alive.any():
+        raise ValueError("LEB128 の 5 バイトに収まらない値がある")
+    return out[np.arange(5)[None, :] < length[:, None]].tobytes()
+
+
+def leb128_decode(data, count):
+    """LEB128 の列（bytes）を int64 の配列（count 個）にする。"""
+    buf = np.frombuffer(data, dtype=np.uint8)
+    ends = np.flatnonzero((buf & 0x80) == 0)
+    if ends.size != count:
+        raise ValueError(f"LEB128 の値の数が違う（{ends.size} / {count}）")
+    starts = np.concatenate([[0], ends[:-1] + 1]).astype(np.int64)
+    lens = ends - starts + 1
+    pos = np.arange(buf.size) - np.repeat(starts, lens)
+    contrib = (buf & 0x7F).astype(np.int64) << (7 * pos)
+    vals = np.add.reduceat(contrib, starts)
+    neg = (buf[ends] & 0x40) != 0
+    return vals - np.where(neg, np.left_shift(np.int64(1), 7 * lens), 0)
+
+
+def _sfnn_block(values):
+    body = leb128_encode(values)
+    return LEB128_MAGIC + struct.pack("<I", len(body)) + body
+
+
+def _sfnn_read_block(data, off, count):
+    if data[off:off + 17] != LEB128_MAGIC:
+        raise ValueError("LEB128 の目印が無い")
+    off += 17
+    (nbytes,) = struct.unpack_from("<I", data, off)
+    off += 4
+    return leb128_decode(data[off:off + nbytes], count), off + nbytes
+
+
+def sfnn_out_dims(H1):
+    """fc_0 の出力の数：近道つき（H1 が 8n−1）なら H1 + 1、そうでなければ H1。"""
+    return H1 + (1 if H1 % 8 == 7 else 0)
+
+
+def write_sfnn(path, arch_str, feature, W, H1, H2, S, q):
+    """SFNN の nn.bin を書く。q の形：ft_b (W,)、ft_w (次元, W)、b0 (S, O0)、w0 (S, O0, W)、
+    b1 (S, H2)、w1 (S, H2, 2H1)、b2 (S, 1)、w2 (S, 1, H2)。値は量子化済み（ファイルに書く値）。"""
+    s = arch_str.encode()
+    with open(path, "wb") as f:
+        f.write(struct.pack("<III", VERSION, SFNN_HASH, len(s)))
+        f.write(s)
+        f.write(struct.pack("<I", SFNN_FT_HASH))
+        f.write(_sfnn_block(np.asarray(q["ft_b"]).reshape(-1)))
+        f.write(_sfnn_block(np.asarray(q["ft_w"]).reshape(-1)))
+        for j in range(S):
+            f.write(struct.pack("<I", SFNN_NET_HASH))
+            for b, w, cols in (("b0", "w0", W), ("b1", "w1", 2 * H1), ("b2", "w2", H2)):
+                f.write(np.ascontiguousarray(q[b][j], dtype="<i4").tobytes())
+                f.write(_padded(q[w][j], pad32(cols)))
+
+
+def read_sfnn(path, arch_str, feature, W, H1, H2, S):
+    """SFNN の nn.bin を読んで、write_sfnn と同じ形の dict を返す（ハッシュ・構造の文字列・長さを確かめる）。"""
+    with open(path, "rb") as f:
+        data = f.read()
+    ver, h, n = struct.unpack_from("<III", data, 0)
+    if ver != VERSION or h != SFNN_HASH:
+        raise ValueError("SFNN の nn.bin の版かハッシュが違う")
+    if data[12:12 + n].decode() != arch_str:
+        raise ValueError("SFNN の nn.bin の構造の文字列が違う")
+    off = 12 + n
+    if struct.unpack_from("<I", data, off)[0] != SFNN_FT_HASH:
+        raise ValueError("SFNN の nn.bin の特徴変換のハッシュが違う")
+    off += 4
+    nf = num_features(feature)
+    ft_b, off = _sfnn_read_block(data, off, W)
+    ft_w, off = _sfnn_read_block(data, off, nf * W)
+    out = {"ft_b": ft_b, "ft_w": ft_w.reshape(nf, W)}
+    O0 = sfnn_out_dims(H1)
+    for k in ("b0", "w0", "b1", "w1", "b2", "w2"):
+        out[k] = []
+    for _ in range(S):
+        if struct.unpack_from("<I", data, off)[0] != SFNN_NET_HASH:
+            raise ValueError("SFNN の nn.bin のスタックのハッシュが違う")
+        off += 4
+        for b, w, rows, cols in (("b0", "w0", O0, W), ("b1", "w1", H2, 2 * H1), ("b2", "w2", 1, H2)):
+            out[b].append(np.frombuffer(data, "<i4", rows, off).astype(np.int64))
+            off += 4 * rows
+            pc = pad32(cols)
+            out[w].append(np.frombuffer(data, "i1", rows * pc, off).reshape(rows, pc)[:, :cols].astype(np.int64))
+            off += rows * pc
+    if off != len(data):
+        raise ValueError(f"SFNN の nn.bin の長さが合わない（{off} / {len(data)}）")
+    for k in ("b0", "w0", "b1", "w1", "b2", "w2"):
+        out[k] = np.stack(out[k])
+    return out

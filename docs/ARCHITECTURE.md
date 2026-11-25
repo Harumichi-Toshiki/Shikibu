@@ -59,6 +59,7 @@ Python からは `shikibu_feat` という名前で呼びます（`Cargo.toml` �
 | `src/stats.rs` | 統計（勝敗欠損の判定）と eval_scale の推定（黄金分割探索） | `psv_stats`・`estimate_eval_scale` |
 | `src/rng.rs` | 乱数（SplitMix64）。状態を保存・復元できる | `Rng` |
 | `src/bench.rs` | 計測用：Python を介さない解読と特徴抽出の速さ | `bench_extract` |
+| `src/dl.rs` | DL 用の「詰めた局面」（M11）：盤 81・持ち駒 14・王手・指し手の番号 2187。`dl_record` と `dl_of`（バッチ）。指し手の番号は cshogi の `move16_from_psv` と一致（全符号で確認） | `compact`・`label`・`dl_record`・`dl_of`・`DlBatch` |
 
 - `unsafe` は使っていません。
 - 外部の依存は pyo3・numpy のみです（`Cargo.toml`）。
@@ -76,9 +77,12 @@ Python からは `shikibu_feat` という名前で呼びます（`Cargo.toml` �
 | `nnbin.py` | やねうら王の nn.bin の並び・ハッシュ・構造の文字列（特徴と幅・層を引数に取る）。`write`・`read`・`file_size` |
 | `lab.py` | 評価関数の構造の実験室（§S12）。`PRESETS`・`describe`・`make_config`・`write_config`・`compare_runs`（val_loss の比較）・`export_run` |
 | `quantsim.py` | §E4 の量子化を Python で再現する確認用ツール（凍結区画ではない） |
+| `dl_features.py` | DL の入力（M11）：詰めた局面 → 55 チャンネル（`expand`、GPU で一括）、HL-Gauss（`hl_gauss`）、hcpe からの検証用（`from_hcpe`） |
+| `dl_networks.py` | DL のネットワーク（M11）：構造の名前の読み取り（`parse_dl`）、ブロックの登録表（`BLOCKS`・`register_block`）、`build_dl`、`describe_dl`（macs・params）、`PRESETS` |
+| `train_dl.py` | DL の学習ループ（M11）：`python -m shikibu.train_dl`。損失・検証・保存と再開・`max_minutes`。`train.py` の部品（設定の読み込みの型、ロック、`Status`、`JsonlLog`、`lr_factor`、`epoch_perm`、eval_scale の推定）を使い回す |
 | `__init__.py` | パッケージの説明だけ |
 
-CLI は `python -m shikibu.train`・`python -m shikibu.export`・`python -m shikibu.quantsim` です（`PYTHONPATH=python` が必要）。
+CLI は `python -m shikibu.train`・`python -m shikibu.export`・`python -m shikibu.quantsim`・`python -m shikibu.train_dl`（DL）です（`PYTHONPATH=python` が必要）。
 
 ---
 
@@ -89,13 +93,15 @@ CLI は `python -m shikibu.train`・`python -m shikibu.export`・`python -m shik
 | `tools/shk_tools.py` | データの CLI：`stats`・`estimate-scale`・`shuffle` | 変更可 |
 | `tools/shk_monitor.py` | Colab 用の監視ツール（学習を裏で起動し、進みを表示する） | 変更可 |
 | `tools/make_engine_golden.py` | エンジン用の正解データを作る CLI | 変更可 |
+| `tools/shk_speedcheck_dl.py` | DL の速さを段階ごと（読み込み・展開・学習の 1 ステップ）に測る（M11）。Colab で持ち主が測る | 変更可 |
 | `bench/bench_loader.py` | ローダーの速さを、スレッド数と version を変えて測る | 変更可 |
 | `perf/perf_check.py` | 速度の合格判定（変更禁止） | 変更禁止 |
 | `reference/raypair_ref.py` | 特徴量の参照実装（Python、遅い。付録A）（変更禁止） | 変更禁止 |
 | `tests/` | 受け入れテスト（変更禁止） | 変更禁止 |
-| `configs/` | 設定ファイル（`colab_v0.toml`・`colab_v1.toml`） | 変更可 |
+| `configs/` | 設定ファイル（`colab_v0.toml`・`colab_v1.toml`・`colab_halfkp.toml`・`colab_lab.toml`・`colab_dl.toml`） | 変更可 |
 | `notebooks/colab_train.ipynb` | Colab の学習用ノートブック | 変更可 |
 | `notebooks/colab_perf.ipynb` | Colab の速度確認用ノートブック（M2.5） | 変更可 |
+| `notebooks/colab_dl.ipynb` | Colab の DL の学習用ノートブック（M11） | 変更可 |
 | `docs/` | 設計書（`DESIGN.md`・`COLAB.md` は変更禁止）と、この文書群 | 文書は変更可 |
 
 ---
@@ -232,3 +238,29 @@ CLI は `python -m shikibu.train`・`python -m shikibu.export`・`python -m shik
 | 2〜3 シャードのシャッフルバッファ（§S3.2） | `shuffle_buffer`（局面数で指定） | 局面数で指定できる形にした |
 | 保存に含まれるスケジューラ（§S6） | なし（学習率は更新回数から計算） | `lr_factor` が更新回数だけで決まるので、状態を持たない |
 
+---
+
+## 6. DL の流れ（M11）
+
+RayPair・HalfKP と違い、CPU は「詰めた局面」だけを作り、55 チャンネルへの展開は GPU でバッチごとに行います。
+
+```
+PSV（40 バイト）
+  │
+  ├─ 読み係・シャッフル・キャッシュ・再開：loader.rs（RayPair と同じ）
+  ▼
+作業係：dl.rs の dl_of（decode_psv → 盤 81・持ち駒 14・王手・指し手の番号 2187。飛ばすものは数える）
+  │  1 局面 約 112 バイト（盤 81 + 持ち駒 14 + 王手 1 の uint8、指し手の int64 8、評価値・勝敗の float32 8）。RayPair の 1 局面 約 数百バイト（特徴の番号）より小さい
+  ▼
+BatchLoader(output="dl") → dict（numpy）
+  │
+  ▼
+train_dl.py：固定メモリ → GPU（非同期）→ dl_features.expand（55 チャンネル、ビット単位で Dainagon と同じ）
+  │  → 順伝播（dl_networks）→ 損失（float32）→ 逆伝播 → clip → AdamW
+  ▼
+checkpoint.pt・log.jsonl・status.json
+```
+
+- 展開の正しさ：`tests/test_m11_acceptance.py` の `test_expand_bit_exact` が、`reference/dainagon_ref.py` の `make_features_v16_fast` と `torch.equal` で比べます。
+- 詰めた局面の正しさ：`test_dl_record_matches_reference`（盤・持ち駒・王手・指し手）と、`tests/test_m11_extra.py` の全符号の比較。
+- 形式の詳細は `docs/FORMATS.md` の 8、ブロックの足し方は `docs/DL_BLOCKS.md`。

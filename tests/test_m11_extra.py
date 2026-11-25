@@ -119,11 +119,13 @@ def test_no_decay_groups():
     nodecay_ids = {id(p) for p in groups[1]["params"]}
     assert not decay_ids & nodecay_ids
     assert len(decay_ids | nodecay_ids) == len([p for p in net.parameters() if p.requires_grad])
+    no_decay_names = ("file_emb", "rank_emb", "gate_attn", "gate_mlp", "relpos_bias", "norm1", "norm2", "bias")
     for name, p in net.named_parameters():
-        if name.endswith("relpos") or name.endswith("bias") or ".bn" in name or ".norm" in name:
+        if any(k in name for k in no_decay_names) or ".bn" in name or "bn" in name.split(".")[-2:][0]:
             assert id(p) in nodecay_ids, name
-        if name.endswith("weight") and ("conv" in name or "fc" in name or "out.weight" in name or "qkv" in name):
-            assert id(p) in decay_ids, name
+        if name.endswith("weight") and any(k in name for k in ("conv", "fc", "qkv", "proj", "ffn", "up", "down", "policy", "value_")):
+            if "bn" not in name and "norm" not in name:
+                assert id(p) in decay_ids, name
     assert groups[0]["weight_decay"] == 1e-3 and groups[1]["weight_decay"] == 0.0
 
 
@@ -218,18 +220,153 @@ def test_fp16_on_cpu_is_refused(tmp_path):
     assert r.returncode != 0 and not (out / "checkpoint.pt").exists()
 
 
-def test_attention_matches_explicit_formula():
-    """注意（SDPA）の結果が、softmax(q·kᵀ/√hd + bias)·v の式と一致する。"""
+
+
+# ---------- F・T は Dainagon と同じ計算（M11.0.1） ----------
+
+def _dainagon_relpos_index():
+    """Dainagon の _build_relpos_index と同じ（index[i, j] = (yi − yj + 8) × 17 + (xi − xj + 8)）。"""
+    idx = torch.zeros(81, 81, dtype=torch.long)
+    for i in range(81):
+        yi, xi = divmod(i, 9)
+        for j in range(81):
+            yj, xj = divmod(j, 9)
+            idx[i, j] = (yi - yj + 8) * 17 + (xi - xj + 8)
+    return idx
+
+
+class _DainagonF(torch.nn.Module):
+    """Dainagon の network_chunagon_v35.py の GatedTransformerBlockRelPos を、そのまま写したもの（テストの参照）。"""
+
+    def __init__(self, channels, num_heads, mlp_ratio=4):
+        super().__init__()
+        nn = torch.nn
+        self.channels = channels
+        self.num_heads = num_heads
+        self.file_emb = nn.Parameter(torch.randn(1, channels, 1, 9) * 0.02)
+        self.rank_emb = nn.Parameter(torch.randn(1, channels, 9, 1) * 0.02)
+        self.norm1 = nn.LayerNorm(channels)
+        self.norm2 = nn.LayerNorm(channels)
+        self.qkv = nn.Linear(channels, channels * 3, bias=False)
+        self.proj = nn.Linear(channels, channels)
+        mlp_hidden = channels * mlp_ratio
+        self.ffn = nn.Sequential(nn.Linear(channels, mlp_hidden), nn.GELU(), nn.Linear(mlp_hidden, channels))
+        self.gate_attn = nn.Parameter(torch.tensor(0.1))
+        self.gate_mlp = nn.Parameter(torch.tensor(0.1))
+        self.relpos_bias = nn.Parameter(torch.zeros(num_heads, 17 * 17))
+        self.register_buffer("relpos_index", _dainagon_relpos_index())
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x_pos = x + self.file_emb + self.rank_emb
+        tokens = x_pos.flatten(2).transpose(1, 2)
+        normed = self.norm1(tokens)
+        qkv = self.qkv(normed).reshape(B, H * W, 3, self.num_heads, C // self.num_heads)
+        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+        attn = (q @ k.transpose(-2, -1)) * (C // self.num_heads) ** -0.5
+        attn = attn + self.relpos_bias[:, self.relpos_index].unsqueeze(0)
+        attn = attn.softmax(dim=-1)
+        attn_out = self.proj((attn @ v).transpose(1, 2).reshape(B, H * W, C))
+        tokens = tokens + self.gate_attn * attn_out
+        tokens = tokens + self.gate_mlp * self.ffn(self.norm2(tokens))
+        return tokens.transpose(1, 2).reshape(B, C, H, W)
+
+
+class _RefGLUT(torch.nn.Module):
+    """T の参照：同じ注意・位置の埋め込み・ゲートで、FFN だけ GLU（Linear(C,2·ffn·C) を 2 つに分け、GELU(ゲート)×値、Linear(ffn·C,C)）。"""
+
+    def __init__(self, channels, num_heads, ffn):
+        super().__init__()
+        self.base = _DainagonF(channels, num_heads)
+        self.base.ffn = torch.nn.Module()
+        self.base.ffn.up = torch.nn.Linear(channels, 2 * ffn * channels)
+        self.base.ffn.down = torch.nn.Linear(ffn * channels, channels)
+        self.ffn_mul = ffn
+
+    def forward(self, x):
+        b = self.base
+        B, C, H, W = x.shape
+        x_pos = x + b.file_emb + b.rank_emb
+        tokens = x_pos.flatten(2).transpose(1, 2)
+        normed = b.norm1(tokens)
+        qkv = b.qkv(normed).reshape(B, H * W, 3, b.num_heads, C // b.num_heads)
+        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+        attn = (q @ k.transpose(-2, -1)) * (C // b.num_heads) ** -0.5
+        attn = attn + b.relpos_bias[:, b.relpos_index].unsqueeze(0)
+        attn = attn.softmax(dim=-1)
+        attn_out = b.proj((attn @ v).transpose(1, 2).reshape(B, H * W, C))
+        tokens = tokens + b.gate_attn * attn_out
+        gate, value = b.ffn.up(b.norm2(tokens)).chunk(2, dim=-1)
+        tokens = tokens + b.gate_mlp * b.ffn.down(torch.nn.functional.gelu(gate) * value)
+        return tokens.transpose(1, 2).reshape(B, C, H, W)
+
+
+def _copy_matching(src, dst):
+    """同じ名前の重み（と buffer 以外の全部）を src から dst へ写す。dst の名前が全部そろうことを確かめる。"""
+    sd = src.state_dict()
+    own = dst.state_dict()
+    missing = [k for k in own if k not in sd and k != "relpos_index"]
+    assert not missing, missing
+    dst.load_state_dict({k: sd[k] for k in own if k in sd}, strict=False)
+
+
+@pytest.mark.parametrize("channels,heads", [(64, 2), (320, 10)])
+def test_F_matches_dainagon(channels, heads):
     from shikibu import dl_networks as N
-    import math
-    torch.manual_seed(0)
-    att = N._Attention(64, 16)
-    x = torch.randn(2, 81, 64)
-    got = att(x)
-    h = att.norm(x)
-    q, k, v = att.qkv(h).view(2, 81, 3, 4, 16).permute(2, 0, 3, 1, 4)
-    bias = att.relpos[:, att.rel_index]
-    w = torch.softmax(q @ k.transpose(-2, -1) / math.sqrt(16) + bias, dim=-1)
-    o = (w @ v).transpose(1, 2).reshape(2, 81, 64)
-    want = att.out(o * torch.sigmoid(att.gate(h)))
-    assert torch.allclose(got, want, atol=1e-5)
+    torch.manual_seed(1)
+    ref = _DainagonF(channels, heads)
+    with torch.no_grad():
+        ref.relpos_bias.normal_(0, 0.5)   # 0 初期化のままだと相対位置を確かめられないので、確かめるときだけ乱数にする
+        ref.gate_attn.fill_(0.7)
+        ref.gate_mlp.fill_(-0.4)
+    ours = N.GatedTransformerBlockRelPos(channels, torch.nn.ReLU, {"hd": channels // heads, "ffn": 2})
+    _copy_matching(ref, ours)
+    ref.eval()
+    ours.eval()
+    x = torch.randn(3, channels, 9, 9)
+    with torch.no_grad():
+        want = ref(x)
+        got = ours(x)
+    assert float((got - want).abs().max()) < 1e-5
+
+
+@pytest.mark.parametrize("channels,heads", [(64, 2), (320, 10)])
+def test_T_matches_glu_reference(channels, heads):
+    from shikibu import dl_networks as N
+    torch.manual_seed(2)
+    ref = _RefGLUT(channels, heads, ffn=2)
+    with torch.no_grad():
+        ref.base.relpos_bias.normal_(0, 0.5)
+        ref.base.gate_attn.fill_(0.3)
+        ref.base.gate_mlp.fill_(0.2)
+    ours = N.LightTransformerBlock(channels, torch.nn.ReLU, {"hd": channels // heads, "ffn": 2})
+    # ours の名前：file_emb・rank_emb・norm1・norm2・qkv・proj・ffn.up・ffn.down・gate_attn・gate_mlp・relpos_bias
+    sd = ref.base.state_dict()
+    sd.update({"ffn.up.weight": ref.base.ffn.up.weight, "ffn.up.bias": ref.base.ffn.up.bias,
+               "ffn.down.weight": ref.base.ffn.down.weight, "ffn.down.bias": ref.base.ffn.down.bias})
+    ours.load_state_dict({k: sd[k] for k in ours.state_dict() if k in sd}, strict=False)
+    ref.eval()
+    ours.eval()
+    x = torch.randn(3, channels, 9, 9)
+    with torch.no_grad():
+        want = ref(x)
+        got = ours(x)
+    assert float((got - want).abs().max()) < 1e-5
+
+
+def test_F_T_init_values():
+    from shikibu import dl_networks as N
+    f = N.GatedTransformerBlockRelPos(64, torch.nn.ReLU, {"hd": 32, "ffn": 2})
+    t = N.LightTransformerBlock(64, torch.nn.ReLU, {"hd": 32, "ffn": 2})
+    for blk in (f, t):
+        assert float(blk.relpos_bias.detach().abs().max()) == 0.0
+        assert abs(float(blk.gate_attn.detach()) - 0.1) < 1e-7 and abs(float(blk.gate_mlp.detach()) - 0.1) < 1e-7
+        assert blk.qkv.bias is None
+    assert tuple(f.file_emb.shape) == (1, 64, 1, 9) and tuple(f.rank_emb.shape) == (1, 64, 9, 1)
+
+
+def test_F_T_macs_formula():
+    from shikibu import dl_networks as N
+    C, ffn = 96, 2
+    assert N.GatedTransformerBlockRelPos.macs(C, {"hd": 32, "ffn": 2}) == 81 * (4 * C * C + 8 * C * C) + 2 * 81 * 81 * C
+    assert N.LightTransformerBlock.macs(C, {"hd": 32, "ffn": ffn}) == 81 * (4 * C * C + 3 * ffn * C * C) + 2 * 81 * 81 * C

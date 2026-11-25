@@ -9,8 +9,9 @@
     hd<N>：T・F の注意のヘッドあたりの次元（16・32・64、既定 32）
     vh<N>：value_head の中間の幅（8 の倍数、8〜2048、既定 256）
 
-登録表（BLOCKS）：S（3×3 conv × 2）・L（7×7 depthwise）・F（ゲート付き注意＋FFN 4 倍）・
-T（F の注意で、FFN を GLU にしたもの）・H（shift9 ＋ 1×1 conv。学習するパラメータは conv だけ）。
+登録表（BLOCKS）：S（3×3 conv × 2）・L（7×7 depthwise）・F（Dainagon の GatedTransformerBlockRelPos と同じ：
+位置の埋め込み・スカラーのゲート・FFN 4 倍）・T（F と同じ注意で、FFN を GLU にしたもの）・
+H（shift9 ＋ 1×1 conv。学習するパラメータは conv だけ）。
 新しいブロックは、__init__(channels, act, opts)・forward・クラスメソッド macs(channels, opts) を持つクラスを
 register_block で登録する（docs/ARCHITECTURE.md の「新しいブロックの足し方」）。
 
@@ -126,34 +127,6 @@ class LargeKernelBlock(nn.Module):
         return 49 * channels * 81 + channels * channels * 81
 
 
-class _Attention(nn.Module):
-    """9×9 の 81 マスを 1 列の 81 トークンとみなす注意。相対位置バイアス（−8〜8 の範囲）とゲート付き。
-    入力・出力は (B, 81, C)。ゲートは、ヘッドを合わせた出力に掛ける（sigmoid(Linear(x)) × attn）。"""
-
-    def __init__(self, channels, hd):
-        super().__init__()
-        self.heads = channels // hd
-        self.hd = hd
-        self.norm = nn.LayerNorm(channels)
-        self.qkv = nn.Linear(channels, 3 * channels)
-        self.gate = nn.Linear(channels, channels)
-        self.out = nn.Linear(channels, channels)
-        self.relpos = nn.Parameter(torch.zeros(self.heads, REL_SIZE * REL_SIZE))
-        nn.init.trunc_normal_(self.relpos, std=0.02)
-        _no_decay(self.relpos, self.norm.weight, self.norm.bias, self.qkv.bias, self.gate.bias, self.out.bias)
-        _no_decay(self.gate.weight)
-        self.register_buffer("rel_index", _rel_index(), persistent=False)
-
-    def forward(self, x):
-        B, N, C = x.shape
-        h = self.norm(x)
-        q, k, v = self.qkv(h).view(B, N, 3, self.heads, self.hd).permute(2, 0, 3, 1, 4)
-        bias = self.relpos[:, self.rel_index].unsqueeze(0).to(q.dtype)  # (1, heads, 81, 81)
-        # softmax(q·kᵀ / √hd + bias)·v。bias を加える形の注意（SDPA）は、81×81 の行列を大きく保たないので、メモリが少なくて済む
-        o = F.scaled_dot_product_attention(q, k, v, attn_mask=bias).transpose(1, 2).reshape(B, N, C)
-        return self.out(o * torch.sigmoid(self.gate(h)))
-
-
 @functools.lru_cache(maxsize=1)
 def _rel_index_cached():
     idx = torch.zeros(N_TOKENS, N_TOKENS, dtype=torch.long)
@@ -166,63 +139,87 @@ def _rel_index_cached():
 
 
 def _rel_index():
-    """(81, 81)：マス i から見たマス j の相対位置（dy + 8）× 17 + (dx + 8) の番号。"""
+    """(81, 81)：マス i から見たマス j の相対位置（dy + 8）× 17 + (dx + 8) の番号（Dainagon の relpos_index と同じ）。"""
     return _rel_index_cached().clone()
 
 
-def _tokens(x):
-    return x.flatten(2).transpose(1, 2)
+class _GLUFFN(nn.Module):
+    """T の FFN：Linear(C, 2·ffn·C) を 2 つに分け、GELU(ゲート) × 値、Linear(ffn·C, C)。"""
 
-
-def _untokens(t, channels):
-    return t.transpose(1, 2).reshape(t.shape[0], channels, 9, 9)
-
-
-class GatedTransformerBlockRelPos(nn.Module):
-    """F：ゲート付きの注意（相対位置バイアス）＋ FFN（C → 4C → C、GELU）。Dainagon の F と同じ計算（FFN 4 倍）。"""
-
-    def __init__(self, channels, act, opts):
+    def __init__(self, channels, ffn):
         super().__init__()
-        self.channels = channels
-        self.attn = _Attention(channels, opts["hd"])
-        self.norm2 = nn.LayerNorm(channels)
-        self.fc1 = nn.Linear(channels, 4 * channels)
-        self.fc2 = nn.Linear(4 * channels, channels)
-        _no_decay(self.norm2.weight, self.norm2.bias, self.fc1.bias, self.fc2.bias)
+        self.up = nn.Linear(channels, 2 * ffn * channels)
+        self.down = nn.Linear(ffn * channels, channels)
+        _no_decay(self.up.bias, self.down.bias)
 
     def forward(self, x):
-        t = _tokens(x)
-        t = t + self.attn(t)
-        t = t + self.fc2(F.gelu(self.fc1(self.norm2(t))))
-        return _untokens(t, self.channels)
+        gate, value = self.up(x).chunk(2, dim=-1)
+        return self.down(F.gelu(gate) * value)
+
+
+class _GatedTransformer(nn.Module):
+    """F・T の共通部分（Dainagon の GatedTransformerBlockRelPos と同じ計算）。
+    位置の埋め込み（file_emb・rank_emb）を入力に足してから、81 トークンの注意（相対位置バイアス、
+    ゼロ初期化）と FFN を、スカラーのゲート（gate_attn・gate_mlp、初期値 0.1）で残差に足す。
+    ffn は子のクラスが作る（F は Sequential(Linear, GELU, Linear)、T は _GLUFFN）。"""
+
+    def __init__(self, channels, hd, ffn):
+        super().__init__()
+        self.channels = channels
+        self.num_heads = channels // hd
+        self.hd = hd
+        self.file_emb = nn.Parameter(torch.randn(1, channels, 1, 9) * 0.02)
+        self.rank_emb = nn.Parameter(torch.randn(1, channels, 9, 1) * 0.02)
+        self.norm1 = nn.LayerNorm(channels)
+        self.norm2 = nn.LayerNorm(channels)
+        self.qkv = nn.Linear(channels, channels * 3, bias=False)
+        self.proj = nn.Linear(channels, channels)
+        self.ffn = ffn
+        self.gate_attn = nn.Parameter(torch.tensor(0.1))
+        self.gate_mlp = nn.Parameter(torch.tensor(0.1))
+        self.relpos_bias = nn.Parameter(torch.zeros(self.num_heads, REL_SIZE * REL_SIZE))
+        self.register_buffer("relpos_index", _rel_index(), persistent=False)
+        _no_decay(self.file_emb, self.rank_emb, self.gate_attn, self.gate_mlp, self.relpos_bias,
+                  self.norm1.weight, self.norm1.bias, self.norm2.weight, self.norm2.bias, self.proj.bias)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x_pos = x + self.file_emb + self.rank_emb
+        tokens = x_pos.flatten(2).transpose(1, 2)                     # (B, 81, C)
+        normed = self.norm1(tokens)
+        qkv = self.qkv(normed).reshape(B, H * W, 3, self.num_heads, self.hd)
+        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+        bias = self.relpos_bias[:, self.relpos_index].unsqueeze(0).to(q.dtype)  # (1, heads, 81, 81)
+        # softmax(q·kᵀ · hd^-1/2 + bias)·v（Dainagon と同じ式。SDPA はメモリが少なくて済む）
+        o = F.scaled_dot_product_attention(q, k, v, attn_mask=bias, scale=self.hd ** -0.5)
+        attn_out = self.proj(o.transpose(1, 2).reshape(B, H * W, C))
+        tokens = tokens + self.gate_attn * attn_out
+        tokens = tokens + self.gate_mlp * self.ffn(self.norm2(tokens))
+        return tokens.transpose(1, 2).reshape(B, C, H, W)
+
+
+class GatedTransformerBlockRelPos(_GatedTransformer):
+    """F：Dainagon の GatedTransformerBlockRelPos と同じ計算（FFN は C → 4C → C、GELU）。"""
+
+    def __init__(self, channels, act, opts):
+        mlp = nn.Sequential(nn.Linear(channels, 4 * channels), nn.GELU(), nn.Linear(4 * channels, channels))
+        super().__init__(channels, opts["hd"], mlp)
+        _no_decay(mlp[0].bias, mlp[2].bias)
 
     @classmethod
     def macs(cls, channels, opts):
-        return 81 * (5 * channels * channels + 8 * channels * channels) + 2 * 81 * 81 * channels
+        return 81 * (4 * channels * channels + 8 * channels * channels) + 2 * 81 * 81 * channels
 
 
-class LightTransformerBlock(nn.Module):
-    """T：F と同じ注意。FFN は GLU（Linear(C, 2·ffn·C) を 2 つに分け、GELU(ゲート) × 値、Linear(ffn·C, C)）。"""
+class LightTransformerBlock(_GatedTransformer):
+    """T：F と同じ注意・位置の埋め込み・スカラーのゲート。FFN だけ GLU（中間の幅は ffn × C）。"""
 
     def __init__(self, channels, act, opts):
-        super().__init__()
-        self.channels = channels
-        self.attn = _Attention(channels, opts["hd"])
-        self.norm2 = nn.LayerNorm(channels)
-        self.fc1 = nn.Linear(channels, 2 * opts["ffn"] * channels)
-        self.fc2 = nn.Linear(opts["ffn"] * channels, channels)
-        _no_decay(self.norm2.weight, self.norm2.bias, self.fc1.bias, self.fc2.bias)
-
-    def forward(self, x):
-        t = _tokens(x)
-        t = t + self.attn(t)
-        gate, value = self.fc1(self.norm2(t)).chunk(2, dim=-1)
-        t = t + self.fc2(F.gelu(gate) * value)
-        return _untokens(t, self.channels)
+        super().__init__(channels, opts["hd"], _GLUFFN(channels, opts["ffn"]))
 
     @classmethod
     def macs(cls, channels, opts):
-        return 81 * (5 * channels * channels + 3 * opts["ffn"] * channels * channels) + 2 * 81 * 81 * channels
+        return 81 * (4 * channels * channels + 3 * opts["ffn"] * channels * channels) + 2 * 81 * 81 * channels
 
 
 class ShiftBlock(nn.Module):
@@ -381,7 +378,7 @@ def build_dl(name):
 
 
 def param_groups(model, weight_decay):
-    """重み減衰を掛けるものと掛けないもの（BN・LN の重み、バイアス、相対位置バイアス、ゲートの重み）。"""
+    """重み減衰を掛けるものと掛けないもの（BN・LN の重み、バイアス、相対位置バイアス、位置の埋め込み、スカラーのゲート）。"""
     decay, no_decay = [], []
     for p in model.parameters():
         if not p.requires_grad:

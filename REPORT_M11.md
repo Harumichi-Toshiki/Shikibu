@@ -56,7 +56,7 @@
 3. **展開の大駒の利き**。方向ごとに「元の駒から手前がすべて空き」を、占有の累積積で求める。方向の集合は 180° 回転で閉じるので、座標の回転の前後で同じ結果になる（展開は座標を回さない）。
 4. **損失**。指示の式のとおり。方策は `label_smoothing` 付きの CE、価値は HL-Gauss の CE、勝敗は BCE。価値の目標は `sigmoid(score / eval_scale)`。
 5. **検証の value_mse**。PSV は `eval_scale`、hcpe は `score / 600`（指示どおり）。`policy_acc` は合法手で絞らない（Dainagon と同じ）。
-6. **注意の計算**。`scaled_dot_product_attention` に相対位置バイアスを加法マスクとして渡す。最初は 81×81 の行列を明示的に作っていたが、CPU でバッチ 4096 がメモリ不足で落ちたので変えた。数式は同じで、`test_attention_matches_explicit_formula` で式と比べて確かめた。
+6. **注意の計算**。`scaled_dot_product_attention` に相対位置バイアスを加法マスクとして渡す（F・T とも）。最初は 81×81 の行列を明示的に作っていたが、CPU でバッチ 4096 がメモリ不足で落ちたので変えた。数式は同じ（M11.0.1 で Dainagon の F と比べて確かめた。§9）。
 7. **ログの形**。各行は `type` と `kind` の両方に同じ値（`shk_monitor` と今の学習器が `type` を読み、受け入れテストは `kind` を読むため）。
 8. **train.py の部品の再利用**。`load_config`・`check_placeholders` の一部・`train_paths`・`epoch_perm`・`lr_factor`・`Status`・`JsonlLog`・`sample_scale_positions`・`eval_scale_setting`・`seed_everything`・`rng_state`・`restore_rng`・`fmt_sec`・`_on_term`・`TrainLock` を import。`train.py` は変更していない。ただし DL の設定の既定値・検査は `train_dl.py` に別に置いた（キーが違うため）。
 9. **オプティマイザの口**。`train_dl.make_optimizer` の 1 か所。未知の名前は `validate` で止まる。
@@ -64,7 +64,7 @@
 
 ## 6. 未確認・既知の問題（持ち主に確かめてほしいこと）
 
-- **S・L・F の中身が Dainagon と同じかは確かめていない。** `network_chunagon_v35.py` がリポジトリにもキットにも無いため、指示の説明（「Dainagon と同じ計算」）から書いた。特に F・T の注意の出力に掛けるシグモイドのゲートと LayerNorm の位置、L の 7×7 depthwise の後ろの形は、私の解釈です。学習そのものは新しく始めるので影響は限定的ですが、「Dainagon と同じブロック」と言える根拠はありません。`dl_networks.py` の `StandardBlock`・`LargeKernelBlock`・`GatedTransformerBlockRelPos` を、持ち主のコードと照らしてください。
+- **（M11.0.1 で解消）F・T は Dainagon と照合して直した（§9）。S・L と頭は設計担当が Dainagon と照合し、同じ計算と確認済み。** 学習そのものは新しく始めるので影響は限定的です。
 - **メモリ（X2 が心配）。** CPU の fp32 でバッチ 256 の 1 ステップのピーク増分から見積もると、1 局面あたり A 約 6.5 MB、B 約 7.1 MB、X2 約 9.7 MB。bf16 の GPU ではこの 6 割ほどの見込み。**バッチ 4096 で X2 は L4（24 GB）に入らない可能性がある。** 入らなければ 2048 か 1024 にして、`total_steps`・`max_steps` を合わせて調整してください（`docs/GUIDE_COLAB.md` の 8.2）。実測で決めてください。
 - **GPU の速さは未計測。** `tools/shk_speedcheck_dl.py` を Colab で実行して測ってください。
 - **未確認の経路**：`amp = "fp16"`（GradScaler。CPU では拒否することだけ確かめた）、`compile = true`（CPU では未実行。既定は true なので、Colab で最初に確かめてください）、`channels_last` の GPU 側、CUDA の固定メモリ経路（`DLPrefetcher` の CUDA 分岐）。
@@ -88,3 +88,36 @@ python -m pytest -q tests                             # 全体
 python check_protected.py                             # OK
 python tools/shk_speedcheck_dl.py --repo . --glob "<学習データ>/*.psv" --presets A,B,X2 --batch 4096 --threads 11
 ```
+
+## 9. M11.0.1：F・T を Dainagon と同じ計算にする
+
+設計担当が Dainagon の `network_chunagon_v35.py` と照合し、F（GatedTransformerBlockRelPos）と、同じ注意を使う T が違うと分かった。直した内容：
+
+| 項目 | 前（M11） | 後（M11.0.1、Dainagon と同じ） |
+|---|---|---|
+| 位置の埋め込み | 無い | `file_emb (1,C,1,9)`・`rank_emb (1,C,9,1)`（乱数 ×0.02）を、トークンにする前に入力へ足す |
+| qkv | `Linear(C, 3C)`（bias あり） | `Linear(C, 3C, bias=False)` |
+| ゲート | 注意の出力に `sigmoid(Linear(h))`（要素ごと）。FFN にゲート無し | スカラーの `gate_attn`・`gate_mlp`（初期値 0.1）。注意の出力と FFN の出力に掛けてから残差に足す |
+| 相対位置バイアス | 切断正規分布（0.02） | ゼロ初期化 |
+| 名前 | `attn.qkv`・`attn.out`・`attn.gate` など | Dainagon と同じ（`file_emb`・`rank_emb`・`norm1`・`norm2`・`qkv`・`proj`・`ffn.0`・`ffn.2`・`gate_attn`・`gate_mlp`・`relpos_bias`） |
+
+変えなかったもの：LayerNorm の位置（注意の前に `norm1`、FFN の前に `norm2`）、`proj`（bias あり）、FFN の形（F は `Linear(C,4C)`・GELU・`Linear(4C,C)`、bias あり）、`scale = hd^-0.5`、相対位置の番号（`(dy+8)×17+(dx+8)`）。
+
+T は F と同じ注意・位置の埋め込み・スカラーのゲートで、FFN だけ GLU（`Linear(C, 2·ffn·C)` を 2 つに分け、`GELU(ゲート) × 値`、`Linear(ffn·C, C)`）。
+
+macs：F は `81 × (4C² + 8C²) + 2·81²·C`、T は `81 × (4C² + 3·ffn·C²) + 2·81²·C`（ゲートの Linear が無くなった分だけ減った）。
+
+### 確かめたこと（`tests/test_m11_extra.py`）
+
+- `test_F_matches_dainagon`（C=64・heads=2、C=320・heads=10）：Dainagon の F のコードをテストの中にそのまま置き、同じ重みを入れて、乱数の入力で出力を比べた。最大の差は 1e-5 未満（通過）。参照側の `relpos_bias` は確かめるために乱数にし、ゲートは 0.7・−0.4 にした（Shikibu 側へ同じ値を写す）。
+- `test_T_matches_glu_reference`（同じ 2 通り）：FFN だけ GLU にした参照と比べた（通過）。
+- `test_F_T_init_values`：`relpos_bias` が全部 0、`gate_attn`・`gate_mlp` が 0.1、`qkv` に bias が無い、`file_emb`・`rank_emb` の形。
+- `test_F_T_macs_formula`：macs の式。
+- `test_no_decay_groups`：位置の埋め込み・ゲート・相対位置バイアス・LN・バイアスは減衰しない組に入る。
+
+### テストの結果
+
+- `tests/test_m11_acceptance.py`：22/22 通過（F・T を含む網の macs の見積もり、学習の数歩も含む）。
+- `tests/test_m11_extra.py`：17/17 通過。
+- 全体（`python -m pytest -q tests`）：235 件通過、1 件失敗。失敗は `tests/test_m51_acceptance.py::test_configs_are_templates`（M5.1 の変更禁止のテスト）。`configs/colab_dl.toml` が DL 専用のキーを持つため、RayPair の学習器が「ひな形」のエラーより前に未知のキーで止まる。テストも学習器も変えていない（持ち主の判断待ち）。
+

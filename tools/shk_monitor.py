@@ -45,7 +45,9 @@ def start(config_path, repo=REPO, force=False):
         return
     cfg = _cfg(config_path)
     ck = os.path.join(_out_dir(cfg), "checkpoint.pt")
-    cmd = [sys.executable, "-u", "-m", "shikibu.train", "--config", config_path]
+    # DL（model.network が dl_ で始まる）は shikibu.train_dl、それ以外は従来の shikibu.train（M11）
+    module = "shikibu.train_dl" if str(cfg["model"]["network"]).startswith("dl_") else "shikibu.train"
+    cmd = [sys.executable, "-u", "-m", module, "--config", config_path]
     if os.path.exists(ck):
         cmd.append("--resume")
     if force:
@@ -208,7 +210,12 @@ def render(config_path, fig_path=None):
         lines.append(f"直近の損失：{st['trains'][-1]['loss']:.4f}   学習率：{st['trains'][-1].get('lr', 0):.2e}")
     if st["vals"]:
         v = st["vals"][-1]
-        lines.append(f"検証：損失 {v['val_loss']:.4f} / MSE {v['val_mse']:.5f}（{v['step']:,} ステップ時点）")
+        if "val_loss" in v:
+            lines.append(f"検証：損失 {v['val_loss']:.4f} / MSE {v['val_mse']:.5f}（{v['step']:,} ステップ時点）")
+        else:  # DL（M11）：検証の行は種類（psv・hcpe）ごとにある。直近の 1 つを出す
+            lines.append(f"検証（{v.get('source', '?')}）：方策の一致 {100 * v['policy_acc']:.2f}% / "
+                         f"価値の MSE {v['value_mse']:.5f} / 勝敗の一致 {100 * v['result_acc']:.1f}%"
+                         f"（{v['step']:,} ステップ時点）")
     if st["eval_scale"]:
         lines.append(f"eval_scale：{st['eval_scale']:.1f}")
     if fig_path and st["trains"]:
@@ -222,8 +229,10 @@ def render(config_path, fig_path=None):
         sm = [sum(ys[max(0, i - k):i + 1]) / len(ys[max(0, i - k):i + 1]) for i in range(len(ys))]
         ax[0].plot(xs, ys, alpha=0.25, lw=0.8, label="学習の損失")
         ax[0].plot(xs, sm, lw=1.6, label="学習の損失（平滑化）")
-        if st["vals"]:
-            ax[0].plot([v["step"] for v in st["vals"]], [v["val_loss"] for v in st["vals"]], "o-", ms=3, label="検証の損失")
+        vals = [v for v in st["vals"] if "val_loss" in v or v.get("source") == "psv"]  # DL は psv の方策の損失
+        if vals:
+            ax[0].plot([v["step"] for v in vals], [v.get("val_loss", v.get("loss_p")) for v in vals], "o-", ms=3,
+                       label="検証の損失")
         ax[0].set_xlabel("ステップ"); ax[0].set_title("損失"); ax[0].legend(fontsize=8); ax[0].grid(alpha=0.3)
         pp = [r.get("positions_per_sec", 0) / 1e4 for r in st["trains"]]
         ax[1].plot(xs, pp, lw=1.0)

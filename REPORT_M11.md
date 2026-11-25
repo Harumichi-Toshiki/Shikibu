@@ -150,4 +150,4 @@ M5.1 の変更禁止のテスト `test_configs_are_templates` は、`configs/*.t
 - `tests/test_m11_extra.py`：21/21 通過（今回の追加 4 件を含む）。
 - M5.1 の `test_configs_are_templates`：通過。
 - `python check_protected.py`：`OK`。
-- 全体（`python -m pytest -q tests`）の結果は、この節の次のコミットで記入する。
+- 全体（`python -m pytest -q tests`）：**240 件すべて通過**（終了コード 0。M1〜M10 の 197 件、M11 の受け入れ 22 件、M11 の追加 21 件）。

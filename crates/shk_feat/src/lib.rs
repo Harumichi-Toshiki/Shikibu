@@ -7,6 +7,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 mod bench;
+mod dl;
 mod feature;
 mod halfk;
 mod kingzone;
@@ -105,6 +106,14 @@ fn bench_extract<'py>(
     Ok(d)
 }
 
+/// M11：PSV 1 局面を詰める。戻り値は (盤 81 マスのチャンネル, 持ち駒 14, 王手 0/1, 指し手の番号（変換できなければ −1）)。
+/// 読み解けないレコードは ValueError。
+#[pyfunction]
+fn dl_record(rec: &[u8]) -> PyResult<(Vec<u8>, Vec<u8>, u8, i64)> {
+    let (c, label) = dl::dl_record(rec).map_err(to_py_err)?;
+    Ok((c.board.to_vec(), c.hands.to_vec(), c.check, label))
+}
+
 /// 全局面をシャッフルしてシャードに分割する（§S3.1）。出力はシャードのパス（昇順）。
 #[pyfunction]
 fn shuffle_shards(
@@ -129,6 +138,7 @@ fn shikibu_feat(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(king_squares_sfen, m)?)?;
     m.add_function(wrap_pyfunction!(extract_psv, m)?)?;
     m.add_function(wrap_pyfunction!(bench_extract, m)?)?;
+    m.add_function(wrap_pyfunction!(dl_record, m)?)?;
     m.add_function(wrap_pyfunction!(stats::psv_stats, m)?)?;
     m.add_function(wrap_pyfunction!(stats::estimate_eval_scale, m)?)?;
     m.add_function(wrap_pyfunction!(shuffle_shards, m)?)?;

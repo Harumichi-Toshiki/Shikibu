@@ -106,10 +106,11 @@ PLACEHOLDER_KEYS = [("data", "train_paths"), ("data", "train_glob"), ("data", "v
                     ("data", "cache_dir"), ("output", "out_dir")]
 
 
-def check_placeholders(cfg):
-    """パスに "<…>" の目印が残っていたら、ひな形のまま使おうとしているので止める（何も書かない）。"""
+def check_placeholders(cfg, keys=None):
+    """パスに "<…>" の目印が残っていたら、ひな形のまま使おうとしているので止める（何も書かない）。
+    keys を省略したら PLACEHOLDER_KEYS（NNUE の学習器の従来の検査）。"""
     found = []
-    for sec, key in PLACEHOLDER_KEYS:
+    for sec, key in (PLACEHOLDER_KEYS if keys is None else keys):
         v = cfg[sec][key]
         for s in (v if isinstance(v, list) else [v]):
             if isinstance(s, str) and "<" in s and ">" in s:
@@ -912,11 +913,29 @@ def _on_term(signum, frame):
     raise SystemExit(128 + signum)  # 後始末（ロックの解放）を通すため、例外として抜ける
 
 
+def _is_dl_config(path):
+    """設定の model.network が dl_ で始まるか（大文字・小文字を問わない）。読めないときは False
+    （そのときは従来の処理に任せ、従来どおりのエラーを出す）。"""
+    try:
+        with open(path, "rb") as f:
+            raw = tomllib.load(f)
+        name = raw["model"]["network"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    return isinstance(name, str) and name.strip().lower().startswith("dl_")
+
+
 def main(argv=None):
-    args = parse_args(sys.argv[1:] if argv is None else argv)
+    raw_argv = sys.argv[1:] if argv is None else argv
+    args = parse_args(raw_argv)
     status, lock = None, None
     signal.signal(signal.SIGTERM, _on_term)
     try:
+        if _is_dl_config(args.config):
+            # DL の設定（model.network が dl_…）は、同じ引数のまま DL の学習器へ渡す（M11.0.2）。
+            # 読み込みの前に分岐するので、NNUE の設定の処理はこれまでのまま。
+            from shikibu import train_dl  # 循環を避けるため、ここで読む
+            return train_dl.main(raw_argv)
         cfg = load_config(args.config)
         check_placeholders(cfg)
         validate(cfg)

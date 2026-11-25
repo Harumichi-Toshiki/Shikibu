@@ -161,3 +161,73 @@
 | `shuffle_buffer > 0` で再開 | 窓の中にあった局面は失われる（重複はしない） | `shk_feat` の仕様（REPORT_M2） |
 | `device = "cuda"`（GPU の経路） | 固定メモリ経由の転送と、決定的な計算の設定は、Colab の GPU でしか確かめていない。この環境（CPU のみ）では動かせない | REPORT_M3・M4 |
 
+
+---
+
+## DL の学習（`python -m shikibu.train_dl`、M11）
+
+DL（方策と価値の 2 つの頭）の設定です。RayPair・HalfKP の設定（上の表）とは別のキーを使い、`train_dl` の検査で、知らないキーは止まります。
+ひな形は `configs/colab_dl.toml` です。`model.network` が `dl_` で始まる設定は、`shk_monitor` が自動で `train_dl` を起動します。
+
+### [data]
+
+| キー | 型 | 既定値 | 意味 |
+|---|---|---|---|
+| `train_glob` / `train_paths` | 文字列 / 文字列のリスト | `""` / `[]` | 学習用の PSV。どちらか 1 つ以上 |
+| `val_path` | 文字列 | `""` | 検証用の PSV（任意）。学習に使わないファイルを指定する。`val_positions` 局面を読む |
+| `val_hcpe_glob` | 文字列 | `""` | Dainagon のテストセット（hcpe、任意）。`from_hcpe` で読み、検証の損失は `score / 600` で測る |
+| `cache_dir` | 文字列 | `""` | `train.py` と同じ（ローカルへの先読み）。空なら使わない |
+| `max_cached` | 整数 | `3` | `cache_dir` に同時に置くファイル数の上限（1 以上） |
+| `shuffle_buffer` | 整数 | `0` | 学習中のシャッフル窓（局面数）。0 なら使わない |
+| `num_threads` | 整数 | `1` | 作業係の数（詰めた局面の作成）。Colab は論理コア数 − 1 程度 |
+
+### [model]
+
+| キー | 型 | 既定値 | 意味 |
+|---|---|---|---|
+| `network` | 文字列 | 必須 | 構造の名前 `dl_<C>_<trunk>_<policy>_<value>[_オプション]`（`docs/DL_BLOCKS.md`）。プリセット `A`：`dl_192_SHHHHT_H_HH`、`B`：`dl_128_SSHHHHHHHHTT_H_HH`、`X2`：`dl_192_SSHHHHHHTT_H_HH` |
+
+### [train]
+
+| キー | 型 | 既定値 | 意味 |
+|---|---|---|---|
+| `optimizer` | 文字列 | `"adamw"` | 今は `"adamw"` だけ。ほかの値は設定の誤りとして何も書かずに止まる（オプティマイザを作る口は `train_dl.make_optimizer` の 1 か所） |
+| `batch_size` | 整数 | `4096` | 1 回の更新の局面数（1 以上）。L4 で足りなければ下げる（`REPORT_M11.md` のメモリの見積もり） |
+| `lr` | 実数 | `4e-4` | 学習率の最大値 |
+| `weight_decay` | 実数 | `1e-3` | AdamW の重み減衰。BN・LN の重み、バイアス、相対位置バイアス、位置の埋め込み、スカラーのゲートには掛けない |
+| `warmup_steps` | 整数 | `0` | ウォームアップの更新回数 |
+| `total_steps` | 整数 | 必須 | 学習率のコサイン減衰の長さ（1 以上） |
+| `max_steps` | 整数 | 必須 | 通算の更新回数の上限（1 以上）。達したら保存して終わる |
+| `min_lr_ratio` | 実数 | `0.0` | 減衰の最後の学習率（`lr` に対する比） |
+| `eval_scale` | 文字列または正の数 | `"auto"` | `"auto"` なら勝敗から推定する（`scale_sample` 以下の局面で）。数値なら、その値を使う |
+| `scale_sample` | 整数 | `10000000` | eval_scale の推定に使う局面数の上限 |
+| `value_mix_lambda` | 実数 | `0.5` | 価値の損失の λ（0〜1）。CE（Binned Value）と BCE（勝敗）の比 |
+| `value_loss_scale` | 実数 | `1.5` | 価値の損失全体の倍率 |
+| `label_smoothing` | 実数 | `0.03` | 方策の交差エントロピーのラベル平滑化（0 以上 1 未満） |
+| `grad_clip` | 実数 | `1.0` | 勾配のノルムの上限（`clip_grad_norm_`） |
+| `amp` | 文字列 | `"bf16"` | `"bf16"`（CPU・CUDA）、`"fp16"`（CUDA のみ。`GradScaler` を使い、状態を checkpoint に保存）、`"off"` |
+| `compile` | 真偽値 | `true` | `torch.compile(model)` で学習する。checkpoint にはコンパイル前の重みを保存する |
+| `channels_last` | 真偽値 | `true` | 入力と重みを channels_last の形にする |
+| `device` | 文字列 | `"auto"` | `"auto"`（CUDA があれば使う）、`"cpu"`、`"cuda"` など |
+| `seed` | 整数 | `0` | 乱数の種（重み・ファイルの並び・シャッフル） |
+| `save_every_minutes` | 実数 | `30.0` | この分数ごとに保存する。0 にしてはいけない |
+| `max_minutes` | 実数 | `0` | 経過時間（この実行の分）がこれを超えたら、保存して正常に終わる（`end` 行の `stopped_by` が `"max_minutes"`）。0 なら無制限。Colab の 1 回 8 時間は `480` |
+| `val_every_steps` | 整数 | `0` | この更新回数ごとに検証する。0 なら終わりの 1 回だけ（検証があるとき） |
+| `val_positions` | 整数 | `100000` | 検証に使う先頭の局面数（`val_path`・`val_hcpe_glob` のとき 1 以上） |
+| `log_every_steps` | 整数 | `100` | `log.jsonl` の train 行を書く間隔（1 以上） |
+| `progress_every_sec` | 実数 | `30.0` | 画面の進捗と `status.json` を書く間隔（秒） |
+
+### [output]
+
+| キー | 型 | 既定値 | 意味 |
+|---|---|---|---|
+| `out_dir` | 文字列 | 必須 | 出力フォルダ（`checkpoint.pt`・`log.jsonl`・`status.json`・`train.lock`） |
+
+### 損失（設定との対応）
+
+```
+loss = CE(p, move; label_smoothing) + value_loss_scale × (value_mix_lambda × CE(value_logits, hl_gauss(勝率)) + (1 − value_mix_lambda) × BCE(result_logit, result))
+勝率 = sigmoid(score / eval_scale)
+```
+
+検証の `value_mse` は `v`（Binned Value の期待値）と `sigmoid(score / eval_scale)` の差の 2 乗の平均です（hcpe は `score / 600`）。

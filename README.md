@@ -25,6 +25,7 @@ Shikibu は、将棋の USI 探索エンジン **Nuenagon** が使う評価関�
 - 評価関数の構造（特徴・幅・層）を、設定の 1 行で切り替えて学習し、検証の損失（val_loss）で比べる（実験室）
 - 重みファイルの書き出しと、書き出し後の読み直しによる確認（RayPair は `.shk`、HalfK 系はやねうら王の `nn.bin`）
 - エンジンに渡す前の量子化の確認、エンジン用の正解データの作成
+- DL（方策と価値の 2 つの頭を持つネットワーク）の学習（M11）：詰めた局面を Rust で作り、55 チャンネルへの展開を GPU で一括して行う。構造はブロックの登録表（S・L・F・T・H）の名前で試せる。学習の出力は `checkpoint.pt`（書き出しは M11.1 で ONNX として行う予定）
 
 ## 構成
 
@@ -89,6 +90,12 @@ PYTHONPATH=python python -m shikibu.train --config my_lab.toml
 PYTHONPATH=python python -m shikibu.export --checkpoint <出力>/checkpoint.pt --out nn.bin   # 標準出力に FV_SCALE と EDITION が出る
 ```
 
+### DL を学習する（Colab、M11）
+
+`notebooks/colab_dl.ipynb` を使います（`docs/GUIDE_COLAB.md` の 8）。プリセット `A`・`B`・`X2`、または `dl_…` の名前を、設定セルの `NETWORK` に書きます。
+学習は裏のプロセスで走り、1 回の実行は `max_minutes`（既定 8 時間）で保存して終わります。
+DL の構造の名前と、新しいブロックの足し方は [docs/DL_BLOCKS.md](docs/DL_BLOCKS.md) を参照してください。
+
 ### 構造の名前の読み方
 
 構造の名前は `<特徴>_<W>x2-<L1>-<L2>[_オプション]` と書きます。例：`halfkahm2_512x2-16-32_f`。
@@ -129,10 +136,11 @@ PYTHONPATH=python python -m shikibu.export --checkpoint <出力>/checkpoint.pt -
 | [docs/CONFIG.md](docs/CONFIG.md) | 設定ファイル（TOML）の全キー、既定値、検査 | 学習を回す人・開発者 |
 | [docs/FORMATS.md](docs/FORMATS.md) | PSV、`.shk`、`nn.bin`（HalfK 系）、`checkpoint.pt`、`log.jsonl`、`status.json`、`train.lock` の形式 | 開発者・エンジンの開発者 |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | コードの構成と、データの流れ | 開発者 |
+| [docs/DL_BLOCKS.md](docs/DL_BLOCKS.md) | DL のブロックの足し方（クラスの約束、`macs`、登録、試し方） | 開発者 |
 | [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | 開発の進め方、変更禁止ファイル、テスト、マイルストーン、未解決の課題 | 開発者 |
 | [docs/DESIGN.md](docs/DESIGN.md) | 設計書（凍結区画の第F部を含む。変更禁止） | 全員 |
 | [docs/COLAB.md](docs/COLAB.md) | Colab で回すための方針（変更禁止） | 全員 |
-| `REPORT_M1.md` 〜 `REPORT_M7.md` | マイルストーンごとの報告 | 開発者 |
+| `REPORT_M1.md` 〜 `REPORT_M11.md` | マイルストーンごとの報告 | 開発者 |
 
 ## 変更禁止のファイル
 

@@ -27,6 +27,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
+use crate::dl;
 use crate::feature;
 use crate::position;
 use crate::psv::{self, REC};
@@ -65,12 +66,34 @@ struct Work {
     raw: Result<Option<Vec<u8>>, String>,
 }
 
+/// 作業係の出力の形（M11）。`Features` は従来の nn.EmbeddingBag の形、`Dl` は詰めた局面（dl.rs）。
+#[derive(Clone, Copy)]
+enum Output {
+    Features(u8),
+    Dl,
+}
+
+/// 1 バッチぶんの作業の結果（出力の形による）。
+enum Batch {
+    Features(Features),
+    Dl(dl::DlBatch),
+}
+
+impl Batch {
+    fn is_empty(&self) -> bool {
+        match self {
+            Batch::Features(f) => f.is_empty(),
+            Batch::Dl(b) => b.is_empty(),
+        }
+    }
+}
+
 /// 作業係から呼び出し側へ返す、番号つきの結果。
 struct Done {
     seq: u64,
     cursor: Cursor,
     /// `Ok(None)` は終わり。
-    body: Result<Option<Features>, String>,
+    body: Result<Option<Batch>, String>,
     /// このバッチで飛ばしたレコードの数（M8.1）
     skipped: u64,
 }
@@ -456,16 +479,22 @@ fn produce(
 
 // ---------- 作業係 ----------
 
-fn work_loop(version: u8, rx: Arc<Mutex<Receiver<Work>>>, done: Sender<Done>) {
+fn work_loop(output: Output, rx: Arc<Mutex<Receiver<Work>>>, done: Sender<Done>) {
     loop {
         let w = match lock(&rx).recv() {
             Ok(w) => w,
             Err(_) => return,
         };
         let (body, skipped) = match w.raw {
-            Ok(Some(raw)) => match features_of(&raw, version) {
-                Ok((f, skipped)) => (Ok(Some(f)), skipped),
-                Err(msg) => (Err(msg), 0),
+            Ok(Some(raw)) => match output {
+                Output::Features(version) => match features_of(&raw, version) {
+                    Ok((f, skipped)) => (Ok(Some(Batch::Features(f))), skipped),
+                    Err(msg) => (Err(msg), 0),
+                },
+                Output::Dl => {
+                    let (b, skipped) = dl::dl_of(&raw);
+                    (Ok(Some(Batch::Dl(b))), skipped)
+                }
             },
             Ok(None) => (Ok(None), 0),
             Err(msg) => (Err(msg), 0),
@@ -514,7 +543,28 @@ fn parse_state(d: &Bound<'_, PyDict>, n_files: usize) -> PyResult<Cursor> {
     })
 }
 
-fn to_dict<'py>(py: Python<'py>, f: Features) -> PyResult<Bound<'py, PyDict>> {
+fn to_dict<'py>(py: Python<'py>, b: Batch) -> PyResult<Bound<'py, PyDict>> {
+    match b {
+        Batch::Features(f) => features_to_dict(py, f),
+        Batch::Dl(b) => dl_to_dict(py, b),
+    }
+}
+
+/// DL 形式の dict（M11）。"board" uint8 (n, 81)、"hands" uint8 (n, 14)、"check" uint8 (n,)、
+/// "move" int64 (n,)（2187 の番号）、"score" float32 (n,)、"result" float32 (n,)。
+fn dl_to_dict<'py>(py: Python<'py>, b: dl::DlBatch) -> PyResult<Bound<'py, PyDict>> {
+    let n = b.len();
+    let d = PyDict::new(py);
+    d.set_item("board", numpy::PyArray1::from_vec(py, b.board).reshape([n, 81])?)?;
+    d.set_item("hands", numpy::PyArray1::from_vec(py, b.hands).reshape([n, 14])?)?;
+    d.set_item("check", b.check.into_pyarray(py))?;
+    d.set_item("move", b.moves.into_pyarray(py))?;
+    d.set_item("score", b.score.into_pyarray(py))?;
+    d.set_item("result", b.result.into_pyarray(py))?;
+    Ok(d)
+}
+
+fn features_to_dict<'py>(py: Python<'py>, f: Features) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     d.set_item("stm_indices", f.stm_idx.into_pyarray(py))?;
     d.set_item("stm_offsets", f.stm_off.into_pyarray(py))?;
@@ -549,7 +599,7 @@ pub struct BatchLoader {
 impl BatchLoader {
     #[new]
     #[pyo3(signature = (paths, batch_size, version, shuffle_buffer=0, seed=0, num_threads=1,
-                        cache_dir=None, max_cached=3, resume_state=None, shuffle_warm=0))]
+                        cache_dir=None, max_cached=3, resume_state=None, shuffle_warm=0, output="features"))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         paths: Vec<String>,
@@ -562,8 +612,14 @@ impl BatchLoader {
         max_cached: usize,
         resume_state: Option<Bound<'_, PyDict>>,
         shuffle_warm: usize,
+        output: &str,
     ) -> PyResult<Self> {
-        let version = crate::check_version(version)?;
+        // output = "features"（既定。従来どおり）か "dl"（M11。version は使わない）
+        let output = match output {
+            "features" => Output::Features(crate::check_version(version)?),
+            "dl" => Output::Dl,
+            _ => return Err(PyValueError::new_err(format!("output は \"features\" か \"dl\": {output}"))),
+        };
         if batch_size == 0 {
             return Err(PyValueError::new_err("batch_size は1以上"));
         }
@@ -629,7 +685,7 @@ impl BatchLoader {
         }
         for _ in 0..num_threads {
             let (rx, tx) = (work_rx.clone(), done_tx.clone());
-            threads.push(thread::spawn(move || work_loop(version, rx, tx)));
+            threads.push(thread::spawn(move || work_loop(output, rx, tx)));
         }
 
         Ok(BatchLoader {

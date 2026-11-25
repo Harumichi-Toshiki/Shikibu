@@ -290,3 +290,60 @@ halfk…（`halfkp`・`halfka1`・`halfka2`・`halfkahm1`・`halfkahm2`）で、
 | `bce` | 推定に使った局面の平均 BCE |
 | `used` | 推定に使った局面数（|score| ≥ 30000 を除いた中から抽出） |
 
+
+---
+
+## 8. DL（M11）
+
+### 8.1 詰めた局面（`BatchLoader(output="dl")` の出力、メモリの中）
+
+PSV の 1 局面を、55 チャンネルの代わりに次の形で渡します。展開は `shikibu.dl_features.expand`（GPU）で行います。
+
+| キー | 型・形 | 内容 |
+|---|---|---|
+| `board` | uint8 (n, 81) | 手番側から見た座標（後手番なら 180° 回す）の各マス（番号 `ty × 9 + tx`）の駒のチャンネル。0〜13 は手番側の駒（歩 香 桂 銀 金 角 飛 玉 と 成香 成桂 成銀 馬 竜）、14〜27 は相手の駒、28 は空き |
+| `hands` | uint8 (n, 14) | 手番側の持ち駒 7 種（歩 香 桂 銀 金 角 飛）、相手の 7 種 |
+| `check` | uint8 (n,) | 手番側の玉が王手されていれば 1 |
+| `move` | int64 (n,) | 指し手の番号（0〜2186）。`dir × 81 + to_y × 9 + to_x`。dir は 0〜9 が移動、10〜19 が成り、20〜26 が打つ（歩 香 桂 銀 金 角 飛 の順） |
+| `score` | float32 (n,) | PSV の評価値（手番側の視点） |
+| `result` | float32 (n,) | `(game_result + 1) / 2`（0・0.5・1） |
+
+- PSV の指し手（16 ビット）は、下位 7 ビットが移動先、次の 7 ビットが移動元（打つときは駒の種類 1〜7）、bit 14 が打つ、bit 15 が成る。マスの番号は PackedSfen と同じ（`(筋 − 1) × 9 + (段 − 1)`）。cshogi の `move16_from_psv` と、全部の符号で一致することを確かめた（`tests/test_m11_extra.py`）。
+- 飛ばすレコード（`skipped()` に数える）：読み解けない・`game_result` が −1〜1 の外・指し手が −1（移動先が盤外、打つ駒の種類が 1〜7 でない、方向が不正）。
+- 検証用（`shikibu.dl_features.from_hcpe`）：hcpe の `bestMove16`（cshogi の 16 ビット）から、同じ形の dict を作る。
+
+### 8.2 checkpoint.pt（DL）
+
+`torch.save` の dict です。書き込みは `checkpoint.pt.tmp` に書いてから改名します。
+
+| キー | 型 | 内容 |
+|---|---|---|
+| `model` | state_dict | 重み（コンパイル前のモデル。`_orig_mod.` の接頭辞は付かない） |
+| `optimizer` | dict | AdamW の状態 |
+| `optimizer_name` | str | `"adamw"`（再開のときに一致を確かめる） |
+| `scaler` | dict または None | `amp = "fp16"` のときの `GradScaler` の状態（それ以外は None） |
+| `step` | int | 通算の更新回数 |
+| `epoch` | int | 周回番号 |
+| `loader_state` | dict | 読み込み位置（`file`・`offset`・`rng`・`n_files`） |
+| `eval_scale` | float | 使っている eval_scale |
+| `eval_scale_source` | `"auto"` または `"config"` | eval_scale の由来 |
+| `network` | str | 正規の構造の名前（例：`dl_192_SHHHHT_H_HH`） |
+| `config` | dict | 学習に使った設定（全体） |
+| `rng` | dict | 乱数の状態（`torch`・`python`・`numpy`、CUDA があれば `cuda`） |
+| `file_perm` | list[int] | 今の周回でのファイルの並び |
+| `bad_records` | int | ここまでに飛ばしたレコードの数 |
+
+### 8.3 log.jsonl（DL）
+
+1 行 1 JSON。**各行は `type` と `kind` の両方に同じ値を持ちます**（`type` は `shk_monitor` と今の学習器に合わせたもの、`kind` は受け入れテストの名前）。`phase` 行だけは `type` と `name` のみです。
+
+| `kind` | 書くとき | 項目 |
+|---|---|---|
+| `start` | 学習（または再開）の開始時 | `step`・`epoch`・`resumed`・`eval_scale`・`eval_scale_source`・`network`・`device`・`n_files`・`config` |
+| `startup` | 学習の 1 ステップ目の前（段階の時間） | `seconds`（`data_check` の秒数など）・`amp`・`compile`・`channels_last`・`optimizer` |
+| `train` | `log_every_steps` ごと | `step`・`epoch`・`loss`・`loss_p`・`loss_v`・`loss_r`・`lr`・`bad_records`・`progress`・`positions_per_sec`・`elapsed_sec` |
+| `val` | `val_every_steps` ごと、と終わりに | `step`・`source`（`"psv"` か `"hcpe"`）・`n`・`policy_acc`（2187 全体の argmax。合法手で絞らない）・`loss_p`・`value_mse`・`result_acc`（引き分けを除く） |
+| `save` | 保存したとき | `step`・`epoch`・`reason`（`"periodic"` または `"final"`） |
+| `end` | 学習の終わり | `step`・`epoch`・`elapsed_sec`・`stopped_by`（`"max_steps"` または `"max_minutes"`） |
+
+`status.json` と `train.lock` の形は RayPair・HalfKP と同じです（§5・§5b）。段階の名前は `data_check`・`eval_scale`・`buffer_fill`・`train`・`done`・`error`。

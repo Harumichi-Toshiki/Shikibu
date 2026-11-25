@@ -187,3 +187,28 @@ python tools/make_engine_golden.py --shk <RUN_NAME>.shk --out golden.json --n 10
 - 節 9 の val_loss は「局面をどれだけ当てられるか」の目安です。強さは対局で確かめてください。
 - 節 10 で、書き出せる構造（`halfk…` の psqt・k3k3 なし → nn.bin、`raypair0・raypair1` → .shk）を書き出します。nn.bin のときは、表示される `FV_SCALE` と `EDITION` を控えてください。
 - 書き出せない構造（psqt・k3k3・`raypair…k`）は、学習と val_loss の比較だけできます。
+
+---
+
+## 8. DL を学習する（M11、`notebooks/colab_dl.ipynb`）
+
+DL（方策と価値の 2 つの頭を持つネットワーク）の学習の手順です。RayPair・HalfKP の手順（上）と同じ流れですが、次の点が違います。
+
+- ノートブックは `notebooks/colab_dl.ipynb`。設定セルの `NETWORK` に、プリセット `A`（幅重視）・`B`（深さ重視）・`X2`（約 2 倍）、または `dl_…` の名前を書きます。
+- ひな形は `configs/colab_dl.toml`。既定は AdamW・バッチ 4096・bf16・`torch.compile`・channels_last・`max_minutes = 480`（1 回 8 時間で保存して終わる）。
+- 出力は `checkpoint.pt`・`log.jsonl`・`status.json`・`config.toml`。`.shk` や `nn.bin` の書き出しは、まだありません（ONNX の書き出しは M11.1。`docs/DL_BLOCKS.md` と `REPORT_M11.md` の引き継ぎを参照）。
+- 節 8（速さの確認）は、学習の前に一度動かすと、プリセットごとの局面/秒が分かります（`tools/shk_speedcheck_dl.py`）。学習中に動かすと、学習の速さが落ちます。
+
+### 8.1 手順
+
+1. 節 1〜節 5 は、`colab_train.ipynb` と同じです（GPU ランタイム、Drive のマウント、リポジトリ、wheel、設定ファイルの書き出し）。wheel は M11 以降のもの（`dl_record` がある）を使ってください。
+2. 設定セルの `NETWORK` と `TEMPLATE`（`configs/colab_dl.toml`）を確かめる。
+3. 節 6 で `mon.start(CONFIG)`、節 7 で `mon.watch(CONFIG)`。表示の「検証」の行は、検証用の PSV（`val_path`）や hcpe（`val_hcpe_glob`）を設定したときだけ出ます。
+4. 8 時間たつと、`status.json` の `phase` が `done` になり、`log.jsonl` の `end` 行の `stopped_by` が `"max_minutes"` になります。続きは、節 6 をもう一度実行します（`checkpoint.pt` から `--resume` で続きます）。
+5. 速さが合わないとき（`shk_monitor` の速度が想定より低い）は、節 8 で測ります。バッチが大きすぎて GPU のメモリが足りないときは、`batch_size` を半分（2048）にして、`total_steps`・`max_steps` を 2 倍にしてください（局面数はそろいます）。
+
+### 8.2 注意
+
+- メモリの見積もり（CPU の fp32 での測定の目安。GPU の bf16 はこの 6 割ほど）：1 局面あたり、A は約 6.5 MB、B は約 7.1 MB、X2 は約 9.7 MB の学習時のメモリ。`batch_size = 4096` は、X2 では L4（24 GB）に入らない見込みです。入らなければ 2048 か 1024 にします（実測で決めてください）。
+- 1 回 8 時間の運用では、`total_steps` が実際の進み具合と合っていると、学習率が正しく下がります。実測の局面/秒から、`total_steps` を決め直してください（`configs/colab_dl.toml` のコメント）。
+- `val_path` の PSV は、学習に使わないファイルにしてください（学習のファイルの一覧から自動で外しますが、フォルダが違うと外れません）。

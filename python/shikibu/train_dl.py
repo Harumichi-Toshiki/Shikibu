@@ -29,7 +29,10 @@ from shikibu import dl_features, dl_networks
 from shikibu.lock import TrainLock
 from shikibu.train import (Status, JsonlLog, epoch_perm, eval_scale_setting, lr_factor, sample_scale_positions,
                            train_paths, pick_device, seed_everything, rng_state, restore_rng, fmt_sec,
-                           check_placeholders, _on_term)
+                           check_placeholders, PLACEHOLDER_KEYS, _on_term)
+
+# 目印 <…> を調べるキー（NNUE の学習器の一覧に、DL の検証の PSV 以外の hcpe を足したもの）
+DL_PLACEHOLDER_KEYS = PLACEHOLDER_KEYS + [("data", "val_hcpe_glob")]
 
 PSV_BYTES = 40
 KEYS = ("board", "hands", "check", "move", "score", "result")
@@ -584,7 +587,7 @@ def main(argv=None):
     signal.signal(signal.SIGTERM, _on_term)
     try:
         cfg = load_config(args.config)
-        check_placeholders(cfg)
+        check_placeholders(cfg, DL_PLACEHOLDER_KEYS)
         validate(cfg)
         out_dir = cfg["output"]["out_dir"]
         os.makedirs(out_dir, exist_ok=True)

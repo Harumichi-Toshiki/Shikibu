@@ -121,3 +121,33 @@ macs：F は `81 × (4C² + 8C²) + 2·81²·C`、T は `81 × (4C² + 3·ffn·C
 - `tests/test_m11_extra.py`：17/17 通過。
 - 全体（`python -m pytest -q tests`）：235 件通過、1 件失敗。失敗は `tests/test_m51_acceptance.py::test_configs_are_templates`（M5.1 の変更禁止のテスト）。`configs/colab_dl.toml` が DL 専用のキーを持つため、RayPair の学習器が「ひな形」のエラーより前に未知のキーで止まる。テストも学習器も変えていない（持ち主の判断待ち）。
 
+
+## 10. 設定テンプレートの検査の失敗を直した（M11.0.2）
+
+### 原因
+
+M5.1 の変更禁止のテスト `test_configs_are_templates` は、`configs/*.toml` の**すべて**を、従来の学習器（`python -m shikibu.train`）に渡し、「ひな形のまま」というエラーで止まることを確かめる。`configs/colab_dl.toml`（M11 で追加。DL の設定）は DL 専用のキー（例：`val_hcpe_glob`・`optimizer`）を持つので、従来の学習器は目印の検査より前に「未知のキー」で止まり、テストが失敗した。
+
+### 直し方
+
+テストと `colab_dl.toml` の場所は変えていない。学習器の入口だけを直した。
+
+1. `python/shikibu/train.py` の `main`：設定を読む前に、TOML の `model.network` だけを見る（`_is_dl_config`）。名前が `dl_` で始まれば（大文字・小文字を問わない）、同じ引数のまま `shikibu.train_dl.main` へ渡し、その戻り値で終わる。`--resume`・`--force-unlock` も同じように渡る（`train_dl` の引数は従来と同じ）。
+   - TOML が読めない・`model.network` が無い・文字列でないときは `False` を返し、従来の処理に任せる（従来どおりのエラーが出る）。
+2. NNUE の設定の処理は 1 ビットも変えていない。分岐は読み込みの前だけで、その後の流れは従来と同じ。`check_placeholders` は `keys` を省略すると従来の一覧（`PLACEHOLDER_KEYS`）を使う。
+3. `python/shikibu/train_dl.py`：目印の検査は `train.check_placeholders(cfg, DL_PLACEHOLDER_KEYS)` を使う。`DL_PLACEHOLDER_KEYS` は従来の一覧に `("data", "val_hcpe_glob")` を足したもの。目印が残っていれば、何も書かず（出力フォルダも作らない）、「設定のひな形のまま」を含むエラーを標準エラーに出して終了コード 1。トレースバックは出さない。
+
+### 確かめたこと（`tests/test_m11_extra.py`）
+
+- `test_train_entry_runs_dl_config`：`python -m shikibu.train --config <DL の設定>` で DL の学習が動き、`log.jsonl` に `train`・`end`、checkpoint の `network` が正しい。
+- `test_train_dl_template_is_refused_without_traceback`：`python -m shikibu.train_dl --config configs/colab_dl.toml`（テンプレートを直接渡す）で、終了コード 1、「設定のひな形のまま」、トレースバックなし。
+- `test_train_entry_template_is_refused_without_traceback`：`python -m shikibu.train --config configs/colab_dl.toml` も同じく止まる。
+- `test_dispatch_only_for_dl_networks`：`colab_dl.toml` は DL、`colab_v1.toml` は NNUE と判定。大文字の `DL_`、読めない TOML、無いファイルは従来の処理（False）。
+- M5.1 の `test_configs_are_templates`：通過（従来は失敗）。
+
+### 件数
+
+- `tests/test_m11_extra.py`：21/21 通過（今回の追加 4 件を含む）。
+- M5.1 の `test_configs_are_templates`：通過。
+- `python check_protected.py`：`OK`。
+- 全体（`python -m pytest -q tests`）の結果は、この節の次のコミットで記入する。

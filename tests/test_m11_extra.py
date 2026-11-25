@@ -370,3 +370,60 @@ def test_F_T_macs_formula():
     C, ffn = 96, 2
     assert N.GatedTransformerBlockRelPos.macs(C, {"hd": 32, "ffn": 2}) == 81 * (4 * C * C + 8 * C * C) + 2 * 81 * 81 * C
     assert N.LightTransformerBlock.macs(C, {"hd": 32, "ffn": ffn}) == 81 * (4 * C * C + 3 * ffn * C * C) + 2 * 81 * 81 * C
+
+
+# ---------- 学習の入口（M11.0.2） ----------
+
+TEMPLATE_DL = os.path.join(ROOT, "configs", "colab_dl.toml")
+TEMPLATE_NNUE = os.path.join(ROOT, "configs", "colab_v1.toml")
+
+
+def _run_module(module, args, extra_env=None):
+    env = dict(os.environ, PYTHONPATH=os.path.join(ROOT, "python"))
+    if extra_env:
+        env.update(extra_env)
+    return subprocess.run([sys.executable, "-m", module, *args], env=env, capture_output=True, text=True,
+                          timeout=900)
+
+
+def test_train_entry_runs_dl_config(tmp_path):
+    """python -m shikibu.train --config <DL の設定> で、DL の学習が動く（train_dl に渡される）。"""
+    d = tmp_path / "tr"
+    d.mkdir()
+    _psv_file(d / "t.psv", 2000)
+    out = tmp_path / "o"
+    cfg = tmp_path / "c.toml"
+    _write_cfg(cfg, f"{d}/*.psv", out, max_minutes=0.02)
+    r = _run_module("shikibu.train", ["--config", str(cfg)])
+    assert r.returncode == 0, r.stdout + r.stderr
+    rows = [json.loads(s) for s in open(out / "log.jsonl", encoding="utf-8") if s.strip()]
+    assert any(x.get("kind") == "train" for x in rows)
+    assert any(x.get("kind") == "end" for x in rows)
+    ck = torch.load(out / "checkpoint.pt", map_location="cpu", weights_only=False)
+    assert ck["network"] == "dl_32_S_0_0"
+
+
+def test_train_dl_template_is_refused_without_traceback(tmp_path):
+    """colab_dl.toml をそのまま使うと、目印（<…>）で止まる。何も書かず、トレースバックを出さず、終了コード 1。"""
+    r = _run_module("shikibu.train_dl", ["--config", TEMPLATE_DL])
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "設定のひな形のまま" in r.stderr and "Traceback" not in r.stderr
+
+
+def test_train_entry_template_is_refused_without_traceback():
+    """shikibu.train に colab_dl.toml を渡しても、DL に回されて同じく目印で止まる。"""
+    r = _run_module("shikibu.train", ["--config", TEMPLATE_DL])
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "設定のひな形のまま" in r.stderr and "Traceback" not in r.stderr
+
+
+def test_dispatch_only_for_dl_networks(tmp_path):
+    from shikibu import train as T
+    assert T._is_dl_config(TEMPLATE_DL) is True
+    assert T._is_dl_config(TEMPLATE_NNUE) is False
+    p = tmp_path / "x.toml"
+    p.write_text('[model]\nnetwork = "DL_32_S_0_0"\n', encoding="utf-8")
+    assert T._is_dl_config(str(p)) is True          # 大文字でも DL
+    p.write_text("これは TOML ではない [[[", encoding="utf-8")
+    assert T._is_dl_config(str(p)) is False         # 読めないときは従来の処理へ
+    assert T._is_dl_config(str(tmp_path / "無い.toml")) is False

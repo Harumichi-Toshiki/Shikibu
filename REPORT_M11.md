@@ -7,7 +7,7 @@
 - 受け入れテスト `tests/test_m11_acceptance.py`：**22 件すべて通過**（4000 局面）。大きい乱数局面（`SHIKIBU_M11_N=20000`）でも、詰めた局面・指し手の番号・展開・hcpe 変換の比較が通ることを確かめた。
 - 追加の確認 `tests/test_m11_extra.py`：**12 件通過**（変更禁止ではない。M9.1 の `test_m91_triton.py` と同じ扱い）。
 - 既存の M1〜M10 のテスト：**197 件通過**（M11 の追加の前に、Rust の変更込みで確認）。
-- 全体：TOTAL_PLACEHOLDER
+- 全体（`python -m pytest -q tests`、F・T の変更後）：235 件通過、1 件失敗。失敗は `tests/test_m51_acceptance.py::test_configs_are_templates`（§9 参照。持ち主の判断待ち）。
 - `python check_protected.py`：`OK`。
 - GPU では動かしていません（この環境に GPU が無い）。GPU の速さ・メモリ・bf16／fp16 の実行、`torch.compile` の実行は未確認です（§6）。
 

@@ -13,7 +13,7 @@
 //! マスの番号は PackedSfen と同じ（`(筋 − 1) × 9 + (段 − 1)`）。
 //! 全 65536 通りのうち、移動先が盤内で、移動元が盤内か打ち駒の種類が 1〜7 のものについて、cshogi と一致することを確かめた（M11）。
 
-use crate::position::{Position, Piece};
+use crate::position::{self, Piece, Position};
 use crate::psv;
 
 /// 盤の空きマスのチャンネル番号。
@@ -193,14 +193,100 @@ pub fn label(pos: &Position, mv: u16) -> i64 {
     dir * 81 + cell
 }
 
-/// PSV 1 局面（40 バイト）を詰める。戻り値は (詰めた局面, 指し手の番号)。
-/// 読み解けないレコードは `Err`。指し手が変換できないときは番号が −1。
-pub fn dl_record(rec: &[u8]) -> Result<(Compact, i64), String> {
-    let (pos, _score, mv, _ply, _result) = crate::position::decode_psv(rec)?;
-    let c = compact(&pos);
-    // PSV の指し手が 0 のときは「指し手なし」（cshogi も None として扱う）
-    let l = if mv == 0 { -1 } else { label(&pos, mv) };
-    Ok((c, l))
+/// 指し手の形式（M11.1）。PSV はやねうら王の 16 ビット、hcpe は cshogi の 16 ビット。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Fmt {
+    Psv,
+    Hcpe,
+}
+
+/// cshogi の 16 ビットの指し手を、PSV の 16 ビットの形に直す（`label` に渡すため）。
+/// cshogi は、打つときは移動元に `81 + 駒（歩 81・香 82・桂 83・銀 84・角 85・飛 86・金 87）`、成りは bit 14。
+/// 変換できないもの（移動先が盤外、打つ駒が不正）は 0 を返す（= 指し手なし）。
+pub fn cshogi_move_to_psv(m: u16) -> u16 {
+    let to = m & 0x7f;
+    if to >= 81 {
+        return 0;
+    }
+    let from = (m >> 7) & 0x7f;
+    if from >= 81 {
+        // PSV の打つ：移動元の欄に駒の種類（1 歩 2 香 3 桂 4 銀 5 角 6 飛 7 金）、bit 14 が打つ
+        let pt = match from {
+            81 => 1,
+            82 => 2,
+            83 => 3,
+            84 => 4,
+            85 => 5,
+            86 => 6,
+            87 => 7,
+            _ => return 0,
+        };
+        return to | (pt << 7) | (1 << 14);
+    }
+    let promote = (m >> 14) & 1;
+    to | (from << 7) | (promote << 15)
+}
+
+/// 1 局面を読んで詰める。PSV（40 バイト）と hcpe（38 バイト）を、形式で分ける。
+/// 戻り値は (詰めた局面, 指し手の番号（−1 は変換できない）, 評価値, 勝敗（手番側から見た −1・0・1）)。
+/// 読み解けない・勝敗が範囲外は `Err`（理由の区別は `dl_of` の中で行う）。
+fn read_record(rec: &[u8], fmt: Fmt) -> Result<(Position, i64, i16, i8), Skip> {
+    match fmt {
+        Fmt::Psv => {
+            let (pos, score, mv, _ply, result) = position::decode_psv(rec).map_err(|_| Skip::Unreadable)?;
+            if !(-1..=1).contains(&result) {
+                return Err(Skip::Result);
+            }
+            let l = if mv == 0 { -1 } else { label(&pos, mv) };
+            Ok((pos, l, score, result))
+        }
+        Fmt::Hcpe => {
+            let (pos, score, mv16, gr) = position::decode_hcpe(rec).map_err(|_| Skip::Unreadable)?;
+            let stm = pos.stm;
+            let result: i8 = match gr {
+                0 => 0,
+                1 => {
+                    if stm == 0 {
+                        1
+                    } else {
+                        -1
+                    }
+                }
+                2 => {
+                    if stm == 1 {
+                        1
+                    } else {
+                        -1
+                    }
+                }
+                _ => return Err(Skip::Result),
+            };
+            let mv = cshogi_move_to_psv(mv16);
+            let l = if mv == 0 { -1 } else { label(&pos, mv) };
+            Ok((pos, l, score, result))
+        }
+    }
+}
+
+/// 飛ばしたレコードの理由（`dl_of` の戻り値の添字）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Skip {
+    /// 読み解けない
+    Unreadable = 0,
+    /// 勝敗が −1〜1（hcpe は 0・1・2）の外
+    Result = 1,
+    /// 指し手が −1（`require_move` のときだけ飛ばす）
+    NoMove = 2,
+}
+
+/// 理由の名前（Python の `skip_reasons()` のキー）。
+pub const SKIP_NAMES: [&str; 3] = ["unreadable", "result_range", "no_move"];
+
+/// 1 レコードを詰める（テスト用・公開用）。PSV は 40 バイト、hcpe は 38 バイト。
+/// 戻り値は (盤, 持ち駒, 王手, 指し手の番号, 評価値, 勝敗（0〜1））。
+pub fn dl_record(rec: &[u8], fmt: Fmt) -> Result<(Compact, i64, i16, f32), String> {
+    let (pos, l, score, result) = read_record(rec, fmt).map_err(|e| format!("読み解けない（{:?}）", e))?;
+    Ok((compact(&pos), l, score, (result as f32 + 1.0) * 0.5))
 }
 
 /// バッチの作業結果（DL 形式）。各配列は局面ごとに並ぶ（盤・持ち駒は連結）。
@@ -223,10 +309,14 @@ impl DlBatch {
     }
 }
 
-/// 1 バッチの DL 形式の作業。読み解けないレコード・勝敗が −1〜1 の外・指し手が −1 のレコードは飛ばし、
-/// 飛ばした数を返す（M8.1 と同じ考え方）。
-pub fn dl_of(raw: &[u8]) -> (DlBatch, u64) {
-    let n = raw.len() / psv::REC;
+/// 1 バッチの DL 形式の作業。飛ばしたレコードは理由別に数えて返す（`[読み解けない, 勝敗, 指し手]`）。
+/// `require_move` が真なら、指し手が変換できない局面は飛ばす。偽なら、`moves` を −1 にして残す（M11.1）。
+pub fn dl_of(raw: &[u8], fmt: Fmt, require_move: bool) -> (DlBatch, [u64; 3]) {
+    let rec_len = match fmt {
+        Fmt::Psv => psv::REC,
+        Fmt::Hcpe => position::HCPE_BYTES,
+    };
+    let n = raw.len() / rec_len;
     let mut b = DlBatch {
         board: Vec::with_capacity(n * 81),
         hands: Vec::with_capacity(n * 2 * N_HAND),
@@ -235,19 +325,17 @@ pub fn dl_of(raw: &[u8]) -> (DlBatch, u64) {
         score: Vec::with_capacity(n),
         result: Vec::with_capacity(n),
     };
-    let mut skipped = 0u64;
-    for rec in raw.chunks_exact(psv::REC) {
-        let Ok((pos, score, mv, _ply, result)) = crate::position::decode_psv(rec) else {
-            skipped += 1;
-            continue;
+    let mut skipped = [0u64; 3];
+    for rec in raw.chunks_exact(rec_len) {
+        let (pos, l, score, result) = match read_record(rec, fmt) {
+            Ok(v) => v,
+            Err(reason) => {
+                skipped[reason as usize] += 1;
+                continue;
+            }
         };
-        if !(-1..=1).contains(&result) {
-            skipped += 1;
-            continue;
-        }
-        let l = if mv == 0 { -1 } else { label(&pos, mv) };
-        if l < 0 {
-            skipped += 1;
+        if l < 0 && require_move {
+            skipped[Skip::NoMove as usize] += 1;
             continue;
         }
         let c = compact(&pos);

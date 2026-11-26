@@ -405,3 +405,112 @@ impl BitReader<'_> {
         (((hi << 8) | lo) >> (self.pos % 8) & 0xFF) as usize
     }
 }
+
+// ---------- hcpe（cshogi の HuffmanCodedPos、M11.1） ----------
+
+/// hcpe の 1 レコードの大きさ（hcp 32 + eval 2 + bestMove16 2 + gameResult 1 + dummy 1）。
+pub const HCPE_BYTES: usize = 38;
+
+const HCP_BOARD_CODES: &[Code] = &[
+    (0, 1, None),  // 空き
+    (1, 4, Some((0, 0))),  // 1000
+    (9, 4, Some((0, 8))),  // 1001
+    (5, 4, Some((1, 0))),  // 1010
+    (13, 4, Some((1, 8))),  // 1011
+    (3, 6, Some((0, 1))),  // 110000
+    (35, 6, Some((0, 9))),  // 110001
+    (19, 6, Some((1, 1))),  // 110010
+    (51, 6, Some((1, 9))),  // 110011
+    (11, 6, Some((0, 3))),  // 110100
+    (43, 6, Some((0, 11))),  // 110101
+    (27, 6, Some((1, 3))),  // 110110
+    (59, 6, Some((1, 11))),  // 110111
+    (7, 6, Some((0, 2))),  // 111000
+    (39, 6, Some((0, 10))),  // 111001
+    (23, 6, Some((1, 2))),  // 111010
+    (55, 6, Some((1, 10))),  // 111011
+    (15, 6, Some((0, 4))),  // 111100
+    (47, 6, Some((1, 4))),  // 111101
+    (31, 8, Some((0, 5))),  // 11111000
+    (159, 8, Some((0, 12))),  // 11111001
+    (95, 8, Some((1, 5))),  // 11111010
+    (223, 8, Some((1, 12))),  // 11111011
+    (63, 8, Some((0, 6))),  // 11111100
+    (191, 8, Some((0, 13))),  // 11111101
+    (127, 8, Some((1, 6))),  // 11111110
+    (255, 8, Some((1, 13))),  // 11111111
+];
+
+const HCP_HAND_CODES: &[Code] = &[
+    (0, 3, Some((0, 0))),  // 000
+    (4, 3, Some((1, 0))),  // 001
+    (1, 5, Some((0, 1))),  // 10000
+    (17, 5, Some((1, 1))),  // 10001
+    (3, 5, Some((0, 2))),  // 11000
+    (19, 5, Some((1, 2))),  // 11001
+    (5, 5, Some((0, 3))),  // 10100
+    (21, 5, Some((1, 3))),  // 10101
+    (7, 5, Some((0, 4))),  // 11100
+    (23, 5, Some((1, 4))),  // 11101
+    (31, 7, Some((0, 5))),  // 1111100
+    (95, 7, Some((1, 5))),  // 1111101
+    (63, 7, Some((0, 6))),  // 1111110
+    (127, 7, Some((1, 6))),  // 1111111
+    (2, 3, None),  // 駒箱 010
+    (9, 5, None),  // 駒箱 10010
+    (11, 5, None),  // 駒箱 11010
+    (13, 5, None),  // 駒箱 10110
+    (29, 5, None),  // 駒箱 10111
+    (15, 7, None),  // 駒箱 1111000
+    (47, 7, None),  // 駒箱 1111010
+];
+
+static HCP_BOARD_LUT: [Lut; 256] = build_lut(HCP_BOARD_CODES);
+static HCP_HAND_LUT: [Lut; 256] = build_lut(HCP_HAND_CODES);
+
+/// hcp（32 バイト）を局面に戻す。盤のマスの番号は PackedSfen と同じ（`(筋 − 1) × 9 + (段 − 1)`）。
+/// 手番・玉の位置の 15 ビットは PackedSfen と同じ。盤・持ち駒の符号は PackedSfen と違う（cshogi の set_hcp で確かめた）。
+pub fn decode_hcp(data: &[u8]) -> Result<Position, String> {
+    if data.len() != 32 {
+        return Err(format!("hcp は32バイトのはずが {} バイト", data.len()));
+    }
+    let mut r = BitReader { data, pos: 0 };
+    let mut pos = Position::empty();
+    pos.stm = r.bits(1)? as u8;
+    let king_sq = [r.bits(7)? as usize, r.bits(7)? as usize];
+    for (color, &sq) in king_sq.iter().enumerate() {
+        if sq >= 81 {
+            return Err(format!("玉の位置が不正: {sq}"));
+        }
+        let (y, x) = cshogi_sq_to_yx(sq);
+        pos.board[y][x] = Some(Piece { color: color as u8, pt: 7 });
+    }
+    for sq in 0..81usize {
+        if king_sq.contains(&sq) {
+            continue;
+        }
+        if let Some((color, pt)) = r.read_lut(&HCP_BOARD_LUT)? {
+            let (y, x) = cshogi_sq_to_yx(sq);
+            pos.board[y][x] = Some(Piece { color, pt });
+        }
+    }
+    while r.pos < 256 {
+        // 駒箱の符号（None）は持ち駒に数えない
+        if let Some((color, h)) = r.read_lut(&HCP_HAND_LUT)? {
+            let n = &mut pos.hands[color as usize][h as usize];
+            *n = n.checked_add(1).ok_or("持ち駒が多すぎる")?;
+        }
+    }
+    Ok(pos)
+}
+
+/// hcpe の 1 レコード（38 バイト）を読む。戻り値は (局面, 評価値（手番側）, cshogi の 16 ビットの指し手, gameResult の生の値)。
+pub fn decode_hcpe(rec: &[u8]) -> Result<(Position, i16, u16, u8), String> {
+    if rec.len() != HCPE_BYTES {
+        return Err(format!("hcpe は38バイトのはずが {} バイト", rec.len()));
+    }
+    let pos = decode_hcp(&rec[..32])?;
+    let score = i16::from_le_bytes([rec[32], rec[33]]);
+    let mv = u16::from_le_bytes([rec[34], rec[35]]);
+    Ok((pos, score, mv, rec[36]))
+}

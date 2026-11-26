@@ -14,6 +14,7 @@
 //! シャッフルありなら、シャッフル用のバッファに残っていた局面は失うが、重複はしない。
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::fs::{self, File};
 use std::io::{BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -31,6 +32,9 @@ use crate::dl;
 use crate::feature;
 use crate::position;
 use crate::psv::{self, REC};
+
+/// 読み解けないレコードや指し手の無いレコードだけが続いたとき、この件数を超えたら止める（M11.1）。
+const DRY_LIMIT: u64 = 1_000_000;
 use crate::raypair;
 use crate::rng::Rng;
 
@@ -70,7 +74,44 @@ struct Work {
 #[derive(Clone, Copy)]
 enum Output {
     Features(u8),
-    Dl,
+    Dl { fmt: dl::Fmt, require_move: bool },
+}
+
+/// 読んだ・使えた・理由別に飛ばした件数（作業係が更新する。Python からは `LoaderStats` で読む）。
+#[derive(Default)]
+pub struct Stats {
+    processed: AtomicU64,
+    kept: AtomicU64,
+    reasons: [AtomicU64; 3],
+}
+
+/// `BatchLoader.stats()` の戻り値。`__next__` の間も、別のスレッドから読める（M11.1）。
+#[pyclass(module = "shikibu_feat")]
+pub struct LoaderStats {
+    inner: Arc<Stats>,
+}
+
+#[pymethods]
+impl LoaderStats {
+    /// 今までの件数の dict：processed（読んだ）・kept（使えた）・unreadable・result_range・no_move。
+    fn snapshot<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("processed", self.inner.processed.load(Ordering::Relaxed))?;
+        d.set_item("kept", self.inner.kept.load(Ordering::Relaxed))?;
+        for (name, a) in dl::SKIP_NAMES.iter().zip(self.inner.reasons.iter()) {
+            d.set_item(*name, a.load(Ordering::Relaxed))?;
+        }
+        Ok(d)
+    }
+}
+
+/// 1 レコードの大きさ（PSV 40・hcpe 38）。
+fn record_len(output: Output) -> usize {
+    match output {
+        Output::Features(_) => REC,
+        Output::Dl { fmt: dl::Fmt::Hcpe, .. } => position::HCPE_BYTES,
+        Output::Dl { fmt: dl::Fmt::Psv, .. } => REC,
+    }
 }
 
 /// 1 バッチぶんの作業の結果（出力の形による）。
@@ -94,8 +135,10 @@ struct Done {
     cursor: Cursor,
     /// `Ok(None)` は終わり。
     body: Result<Option<Batch>, String>,
-    /// このバッチで飛ばしたレコードの数（M8.1）
-    skipped: u64,
+    /// このバッチで飛ばしたレコードの数（M8.1）。理由別（`dl::Skip`）
+    skipped: [u64; 3],
+    /// このバッチで読んだレコードの数
+    n_records: u64,
 }
 
 /// 1バッチぶんの出力（nn.EmbeddingBag の形式、§S3.3）。
@@ -189,7 +232,19 @@ struct CacheHub {
     cv: Condvar,
     /// コピーしたファイルごとの記録（コピーが済んだ順）
     stats: Mutex<Vec<CopyStat>>,
+    /// コピーの失敗（やり直しの前に記録する）
+    events: Mutex<Vec<CopyEvent>>,
 }
+
+/// コピーの失敗の記録（`cache_events` で返す）。
+struct CopyEvent {
+    file: String,
+    attempt: u32,
+    error: String,
+}
+
+/// 1 ファイルのコピーの試行の上限（失敗したら、理由を記録してやり直す）。
+const COPY_ATTEMPTS: u32 = 3;
 
 impl CacheHub {
     fn new(dir: PathBuf, cap: usize) -> Self {
@@ -204,6 +259,7 @@ impl CacheHub {
             }),
             cv: Condvar::new(),
             stats: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::new()),
         }
     }
 
@@ -245,7 +301,24 @@ fn copy_ahead(paths: Arc<Vec<PathBuf>>, first: usize, hub: Arc<CacheHub>) {
         // 途中のファイルは .part の名前で作り、揃ってから本名にする
         let part = hub.dir.join(format!("{name}.part"));
         let started = Instant::now();
-        let res = fs::copy(&paths[idx], &part).and_then(|n| fs::rename(&part, &dst).map(|_| n));
+        let mut res = Err(std::io::Error::other("コピーを試していない"));
+        for attempt in 1..=COPY_ATTEMPTS {
+            res = fs::copy(&paths[idx], &part).and_then(|n| fs::rename(&part, &dst).map(|_| n));
+            match &res {
+                Ok(_) => break,
+                Err(e) => {
+                    lock(&hub.events).push(CopyEvent {
+                        file: paths[idx].display().to_string(),
+                        attempt,
+                        error: e.to_string(),
+                    });
+                    let _ = fs::remove_file(&part);
+                    if attempt < COPY_ATTEMPTS {
+                        thread::sleep(Duration::from_secs(2));
+                    }
+                }
+            }
+        }
         let seconds = started.elapsed().as_secs_f64();
         let mut st = lock(&hub.state);
         match res {
@@ -286,10 +359,12 @@ fn wait_for_copy(hub: &CacheHub, idx: usize) -> Result<(), String> {
 
 // ---------- 読み係 ----------
 
-/// ファイルを順に開き、40バイトずつレコードを返す。
+/// ファイルを順に開き、1 レコードずつ返す（大きさは PSV 40・hcpe 38）。
 struct Source {
     paths: Arc<Vec<PathBuf>>,
     cache: Option<Arc<CacheHub>>,
+    /// 1 レコードの大きさ
+    rec: usize,
     file: usize,
     offset: u64,
     reader: Option<BufReader<File>>,
@@ -298,10 +373,11 @@ struct Source {
 }
 
 impl Source {
-    fn new(paths: Arc<Vec<PathBuf>>, cache: Option<Arc<CacheHub>>, start: Cursor) -> Self {
+    fn new(paths: Arc<Vec<PathBuf>>, cache: Option<Arc<CacheHub>>, start: Cursor, rec: usize) -> Self {
         Source {
             paths,
             cache,
+            rec,
             file: start.file,
             offset: start.offset,
             reader: None,
@@ -347,11 +423,11 @@ impl Source {
             }
             let reader = self.reader.as_mut().expect("直前に開いた");
             let mut rec = [0u8; REC];
-            let n = psv::read_full(reader, &mut rec)
+            let n = psv::read_full(reader, &mut rec[..self.rec])
                 .map_err(|e| format!("{}: {e}", self.paths[self.file].display()))?;
             match n {
-                REC => {
-                    self.offset += REC as u64;
+                n if n == self.rec => {
+                    self.offset += self.rec as u64;
                     return Ok(Some(rec));
                 }
                 0 => {
@@ -426,22 +502,23 @@ fn produce(
     batch_size: usize,
     shuffle: usize,
     warm: usize,
+    rec_len: usize,
     credit: Receiver<()>,
     work: Sender<Work>,
 ) {
-    let mut src = Source::new(paths, cache, start);
+    let mut src = Source::new(paths, cache, start, rec_len);
     let mut rng = Rng::from_state(start.rng);
     let mut pool: Vec<[u8; REC]> = Vec::with_capacity(shuffle);
-    let mut raw: Vec<u8> = Vec::with_capacity(batch_size * REC);
+    let mut raw: Vec<u8> = Vec::with_capacity(batch_size * rec_len);
     let mut seq = 0u64;
     // バッファの目標の大きさ。warm > 0 なら warm から始めて、バッチを出すたびに batch_size ずつ shuffle まで増やす（M9）
     let mut target = if warm > 0 { warm } else { shuffle };
     loop {
         match next_record(&mut src, &mut pool, &mut rng, target) {
             Ok(Some(rec)) => {
-                raw.extend_from_slice(&rec);
-                if raw.len() == batch_size * REC {
-                    let data = std::mem::replace(&mut raw, Vec::with_capacity(batch_size * REC));
+                raw.extend_from_slice(&rec[..rec_len]);
+                if raw.len() == batch_size * rec_len {
+                    let data = std::mem::replace(&mut raw, Vec::with_capacity(batch_size * rec_len));
                     if !emit(&credit, &work, seq, src.cursor(&rng), data) {
                         return;
                     }
@@ -479,32 +556,48 @@ fn produce(
 
 // ---------- 作業係 ----------
 
-fn work_loop(output: Output, rx: Arc<Mutex<Receiver<Work>>>, done: Sender<Done>) {
+fn work_loop(output: Output, rx: Arc<Mutex<Receiver<Work>>>, done: Sender<Done>, stats: Arc<Stats>) {
     loop {
         let w = match lock(&rx).recv() {
             Ok(w) => w,
             Err(_) => return,
         };
+        let n_records = match &w.raw {
+            Ok(Some(raw)) => (raw.len() / record_len(output)) as u64,
+            _ => 0,
+        };
         let (body, skipped) = match w.raw {
             Ok(Some(raw)) => match output {
                 Output::Features(version) => match features_of(&raw, version) {
-                    Ok((f, skipped)) => (Ok(Some(Batch::Features(f))), skipped),
-                    Err(msg) => (Err(msg), 0),
+                    Ok((f, skipped)) => (Ok(Some(Batch::Features(f))), [skipped, 0, 0]),
+                    Err(msg) => (Err(msg), [0; 3]),
                 },
-                Output::Dl => {
-                    let (b, skipped) = dl::dl_of(&raw);
+                Output::Dl { fmt, require_move } => {
+                    let (b, skipped) = dl::dl_of(&raw, fmt, require_move);
                     (Ok(Some(Batch::Dl(b))), skipped)
                 }
             },
-            Ok(None) => (Ok(None), 0),
-            Err(msg) => (Err(msg), 0),
+            Ok(None) => (Ok(None), [0; 3]),
+            Err(msg) => (Err(msg), [0; 3]),
         };
+        stats.processed.fetch_add(n_records, Ordering::Relaxed);
+        for (a, n) in stats.reasons.iter().zip(skipped.iter()) {
+            a.fetch_add(*n, Ordering::Relaxed);
+        }
+        if let Ok(Some(b)) = &body {
+            let kept = match b {
+                Batch::Features(f) => f.score.len() as u64,
+                Batch::Dl(d) => d.len() as u64,
+            };
+            stats.kept.fetch_add(kept, Ordering::Relaxed);
+        }
         if done
             .send(Done {
                 seq: w.seq,
                 cursor: w.cursor,
                 body,
                 skipped,
+                n_records,
             })
             .is_err()
         {
@@ -593,13 +686,22 @@ pub struct BatchLoader {
     threads: Vec<JoinHandle<()>>,
     /// このローダーで飛ばしたレコードの数（M8.1）
     n_skipped: u64,
+    /// 理由別の飛ばした数（`dl::Skip` の順。M11.1）
+    n_reasons: [u64; 3],
+    /// 作業係が更新する件数（`stats()` で読む）
+    stats: Arc<Stats>,
+    /// キャッシュのコピーの失敗・やり直しの記録（`cache_events()`）
+    cache_events_store: Option<Arc<CacheHub>>,
+    /// 使えるレコードが無いまま読んだ件数（`DRY_LIMIT` を超えたら止める。M11.1）
+    dry: u64,
 }
 
 #[pymethods]
 impl BatchLoader {
     #[new]
     #[pyo3(signature = (paths, batch_size, version, shuffle_buffer=0, seed=0, num_threads=1,
-                        cache_dir=None, max_cached=3, resume_state=None, shuffle_warm=0, output="features"))]
+                        cache_dir=None, max_cached=3, resume_state=None, shuffle_warm=0, output="features",
+                        fmt="psv", require_move=true))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         paths: Vec<String>,
@@ -613,13 +715,27 @@ impl BatchLoader {
         resume_state: Option<Bound<'_, PyDict>>,
         shuffle_warm: usize,
         output: &str,
+        fmt: &str,
+        require_move: bool,
     ) -> PyResult<Self> {
+        // fmt = "psv"（既定）か "hcpe"（M11.1。output="dl" のときだけ）
+        let fmt = match fmt {
+            "psv" => dl::Fmt::Psv,
+            "hcpe" => dl::Fmt::Hcpe,
+            _ => return Err(PyValueError::new_err(format!("fmt は \"psv\" か \"hcpe\": {fmt}"))),
+        };
         // output = "features"（既定。従来どおり）か "dl"（M11。version は使わない）
         let output = match output {
-            "features" => Output::Features(crate::check_version(version)?),
-            "dl" => Output::Dl,
+            "features" => {
+                if fmt != dl::Fmt::Psv {
+                    return Err(PyValueError::new_err("output = \"features\" は fmt = \"psv\" だけ"));
+                }
+                Output::Features(crate::check_version(version)?)
+            }
+            "dl" => Output::Dl { fmt, require_move },
             _ => return Err(PyValueError::new_err(format!("output は \"features\" か \"dl\": {output}"))),
         };
+        let rec_len = record_len(output);
         if batch_size == 0 {
             return Err(PyValueError::new_err("batch_size は1以上"));
         }
@@ -634,7 +750,7 @@ impl BatchLoader {
         }
         let mut sizes = Vec::with_capacity(paths.len());
         for p in &paths {
-            sizes.push(psv::checked_size(p).map_err(PyValueError::new_err)?);
+            sizes.push(psv::checked_size_n(p, rec_len).map_err(PyValueError::new_err)?);
         }
         let paths: Arc<Vec<PathBuf>> = Arc::new(paths.iter().map(PathBuf::from).collect());
         let n_files = paths.len();
@@ -647,7 +763,7 @@ impl BatchLoader {
             },
             Some(d) => parse_state(d, n_files)?,
         };
-        if start.file > n_files || start.offset % REC as u64 != 0 {
+        if start.file > n_files || start.offset % rec_len as u64 != 0 {
             return Err(PyValueError::new_err("resume_state の位置が不正"));
         }
         if start.file < n_files && start.offset > sizes[start.file] {
@@ -672,6 +788,7 @@ impl BatchLoader {
             let _ = credit_tx.send(());
         }
         let work_rx = Arc::new(Mutex::new(work_rx));
+        let stats = Arc::new(Stats::default());
         let mut threads = Vec::new();
         if let Some(hub) = &cache {
             let (p, h) = (paths.clone(), hub.clone());
@@ -680,14 +797,16 @@ impl BatchLoader {
         {
             let (p, c) = (paths.clone(), cache.clone());
             threads.push(thread::spawn(move || {
-                produce(p, c, start, batch_size, shuffle_buffer, shuffle_warm, credit_rx, work_tx)
+                produce(p, c, start, batch_size, shuffle_buffer, shuffle_warm, rec_len, credit_rx, work_tx)
             }));
         }
         for _ in 0..num_threads {
             let (rx, tx) = (work_rx.clone(), done_tx.clone());
-            threads.push(thread::spawn(move || work_loop(output, rx, tx)));
+            let st = stats.clone();
+            threads.push(thread::spawn(move || work_loop(output, rx, tx, st)));
         }
 
+        let cache_events_store = cache.clone();
         Ok(BatchLoader {
             n_files,
             result_rx: Mutex::new(done_rx),
@@ -699,6 +818,10 @@ impl BatchLoader {
             cache,
             threads,
             n_skipped: 0,
+            n_reasons: [0; 3],
+            dry: 0,
+            stats: stats.clone(),
+            cache_events_store,
         })
     }
 
@@ -757,14 +880,27 @@ impl BatchLoader {
                 }
                 Ok(Some(f)) => {
                     self.cursor = done.cursor;
-                    self.n_skipped += done.skipped;
+                    self.n_skipped += done.skipped.iter().sum::<u64>();
+                    for (total, n) in self.n_reasons.iter_mut().zip(done.skipped.iter()) {
+                        *total += n;
+                    }
                     if let Some(tx) = &self.credit_tx {
                         let _ = tx.send(());
                     }
-                    // 全部を飛ばしたバッチは返さず、次のバッチへ進む（枠は返してある）
+                    // 全部を飛ばしたバッチは返さず、次のバッチへ進む（枠は返してある）。
+                    // 使えないレコードが続きすぎたら止める（M11.1）：全部捨てて永遠に待つのを防ぐ
                     if f.is_empty() {
+                        self.dry += done.n_records;
+                        if self.dry > DRY_LIMIT {
+                            self.finished = true;
+                            let [u, r, m] = self.n_reasons;
+                            return Err(PyRuntimeError::new_err(format!(
+                                "使えるレコードが {DRY_LIMIT} 件を超えて続けて無かった（読み解けない {u} 件・勝敗の範囲外 {r} 件・指し手なし {m} 件）。データの形式（PSV か hcpe）と、指し手の有無を確かめてください"
+                            )));
+                        }
                         continue;
                     }
+                    self.dry = 0;
                     return Ok(Some(to_dict(py, f)?));
                 }
             }
@@ -774,6 +910,35 @@ impl BatchLoader {
     /// このローダーで読み解けずに飛ばしたレコードの数（作ってからの合計、M8.1）。
     fn skipped(&self) -> u64 {
         self.n_skipped
+    }
+
+    /// 件数を読むためのハンドル。`__next__` の最中でも、別のスレッドから `snapshot()` が呼べる（M11.1）。
+    fn stats(&self) -> LoaderStats {
+        LoaderStats { inner: self.stats.clone() }
+    }
+
+    /// キャッシュのコピーの失敗とやり直しの記録（dict のリスト：file・attempt・error）（M11.1）。
+    fn cache_events<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let list = PyList::empty(py);
+        if let Some(hub) = &self.cache_events_store {
+            for e in lock(&hub.events).iter() {
+                let d = PyDict::new(py);
+                d.set_item("file", &e.file)?;
+                d.set_item("attempt", e.attempt)?;
+                d.set_item("error", &e.error)?;
+                list.append(d)?;
+            }
+        }
+        Ok(list)
+    }
+
+    /// 飛ばしたレコードを理由別に数える dict（"unreadable"・"result_range"・"no_move"）（M11.1）。
+    fn skip_reasons<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        for (name, n) in dl::SKIP_NAMES.iter().zip(self.n_reasons.iter()) {
+            d.set_item(*name, *n)?;
+        }
+        Ok(d)
     }
 
     /// 直前に返したバッチの直後の位置。JSON にできる dict で、`resume_state` に渡せる。

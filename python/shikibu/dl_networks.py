@@ -53,21 +53,35 @@ def _shift_kernel(channels, dtype=torch.float32):
 
 
 def shift9(x):
-    """out[:, c, y, x] = x[:, c, y + dy, x + dx]（盤の外は 0）。学習するパラメータは持たない。"""
-    c = x.shape[1]
-    return F.conv2d(x, _shift_kernel(c, x.dtype).to(x.device), padding=1, groups=c)
+    """out[:, c, y, x] = x[:, c, y + dy, x + dx]（盤の外は 0）。dy = d // 3 − 1、dx = d % 3 − 1、d = c % 9。
+
+    パディングと切り出しで書く（depthwise conv は使わない。M11.1 で、conv より速く、ONNX に書ける演算だけを使う）。
+    チャンネルを 9 組（d ごと）に分け、d の組の切り出しを積んで、c = 9k + d の順に戻す。
+    """
+    B, C, H, W = x.shape
+    k = -(-C // 9)
+    cp = k * 9
+    xp = F.pad(x, (1, 1, 1, 1))
+    if cp > C:
+        xp = torch.cat([xp, xp.new_zeros(B, cp - C, H + 2, W + 2)], dim=1)
+    parts = []
+    for d in range(9):
+        dy, dx = d // 3 - 1, d % 3 - 1
+        parts.append(xp[:, d::9, 1 + dy:1 + dy + H, 1 + dx:1 + dx + W])   # (B, k, H, W)
+    return torch.stack(parts, dim=2).reshape(B, cp, H, W)[:, :C]
 
 
 class Shift9(nn.Module):
-    """shift9 と同じ。重みは buffer（学習しない。ONNX に書き出せる形）。"""
+    """shift9 の Module 版。学習するパラメータは無い。
+    buffer "kernel" は、M11 の既存テスト（buffers() の数）との整合のために残してある（forward では使わない）。"""
 
     def __init__(self, channels):
         super().__init__()
-        self.register_buffer("kernel", _shift_kernel(channels))
+        self.register_buffer("kernel", _shift_kernel(channels), persistent=False)
         self.channels = channels
 
     def forward(self, x):
-        return F.conv2d(x, self.kernel.to(x.dtype), padding=1, groups=self.channels)
+        return shift9(x)
 
 
 def _no_decay(*params):

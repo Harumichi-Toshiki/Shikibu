@@ -106,12 +106,20 @@ fn bench_extract<'py>(
     Ok(d)
 }
 
-/// M11：PSV 1 局面を詰める。戻り値は (盤 81 マスのチャンネル, 持ち駒 14, 王手 0/1, 指し手の番号（変換できなければ −1）)。
+/// M11：PSV 1 局面を詰める。戻り値は (盤 81 マスのチャンネル, 持ち駒 14, 王手 0/1, 指し手の番号（変換できなければ −1))。
 /// 読み解けないレコードは ValueError。
 #[pyfunction]
 fn dl_record(rec: &[u8]) -> PyResult<(Vec<u8>, Vec<u8>, u8, i64)> {
-    let (c, label) = dl::dl_record(rec).map_err(to_py_err)?;
+    let (c, label, _, _) = dl::dl_record(rec, dl::Fmt::Psv).map_err(to_py_err)?;
     Ok((c.board.to_vec(), c.hands.to_vec(), c.check, label))
+}
+
+/// M11.1（テスト用）：hcpe 1 レコード（38 バイト）を詰める。
+/// 戻り値は (盤, 持ち駒, 王手, 指し手の番号, 評価値, 勝敗（手番から見た 0・0.5・1）)。
+#[pyfunction]
+fn dl_record_hcpe(rec: &[u8]) -> PyResult<(Vec<u8>, Vec<u8>, u8, i64, f32, f32)> {
+    let (c, label, score, result) = dl::dl_record(rec, dl::Fmt::Hcpe).map_err(to_py_err)?;
+    Ok((c.board.to_vec(), c.hands.to_vec(), c.check, label, score as f32, result))
 }
 
 /// 全局面をシャッフルしてシャードに分割する（§S3.1）。出力はシャードのパス（昇順）。
@@ -139,6 +147,7 @@ fn shikibu_feat(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(extract_psv, m)?)?;
     m.add_function(wrap_pyfunction!(bench_extract, m)?)?;
     m.add_function(wrap_pyfunction!(dl_record, m)?)?;
+    m.add_function(wrap_pyfunction!(dl_record_hcpe, m)?)?;
     m.add_function(wrap_pyfunction!(stats::psv_stats, m)?)?;
     m.add_function(wrap_pyfunction!(stats::estimate_eval_scale, m)?)?;
     m.add_function(wrap_pyfunction!(shuffle_shards, m)?)?;

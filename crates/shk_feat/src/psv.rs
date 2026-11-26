@@ -34,11 +34,16 @@ pub fn read_full(reader: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usiz
 
 /// ファイルサイズを返す。40の倍数でなければエラー。
 pub fn checked_size(path: &str) -> Result<u64, String> {
+    checked_size_n(path, REC)
+}
+
+/// ファイルサイズを返す。`rec`（1 レコードの大きさ）の倍数でなければエラー（hcpe は 38、M11.1）。
+pub fn checked_size_n(path: &str, rec: usize) -> Result<u64, String> {
     let len = std::fs::metadata(path)
         .map_err(|e| format!("{path}: {e}"))?
         .len();
-    if len % REC as u64 != 0 {
-        return Err(format!("{path}: サイズが40バイトの倍数でない"));
+    if len % rec as u64 != 0 {
+        return Err(format!("{path}: サイズが{rec}バイトの倍数でない"));
     }
     Ok(len)
 }

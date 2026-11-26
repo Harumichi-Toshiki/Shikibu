@@ -12,11 +12,34 @@
 [data]
 # 学習用の PSV。周回ごとに、ファイルの順番を seed + 周回番号 で並べ替えて読む。
 train_glob = "/content/drive/MyDrive/<学習データのフォルダ>/*.psv"
+# 組ごとに学習の対象を決めるなら、train_glob の代わりに [[data.sources]] を使う（M11.1。docs/CONFIG.md）。
+# 例（コメントを外して使う）：
+# [[data.sources]]
+# name = "moves_hcpe"
+# glob = "/content/drive/MyDrive/<指し手のあるデータ>/*.hcpe"
+# format = "hcpe"
+# weight = 0.5
+# policy = true
+# value = false
+# result = true
+# eval_scale = "auto"
+#
+# [[data.sources]]
+# name = "big_psv"
+# glob = "/content/drive/MyDrive/<評価値と勝敗だけのデータ>/*.psv"
+# format = "psv"
+# weight = 0.5
+# policy = false
+# value = true
+# result = true
+# eval_scale = "auto"
 # 検証用の PSV（任意）。学習に使わないファイルを 1 つ用意して指定する。空なら psv の検証はしない。
 val_path = ""
 # Dainagon のテストセット（hcpe、任意）。空なら hcpe の検証はしない。
 val_hcpe_glob = ""
-cache_dir = "/content/shk_cache"
+# Drive から直接読む（M11.1）。DL は 1 万局面/秒程度なので、読み出しは毎秒 1MB 未満で足りる。
+# 大きい PSV で cache_dir を使うと、コピーの待ち時間が増えるので、既定は空にしている。
+cache_dir = ""
 max_cached = 3
 shuffle_buffer = 20000000
 num_threads = 11

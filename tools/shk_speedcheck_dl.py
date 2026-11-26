@@ -114,6 +114,49 @@ def _expand_for_train(x, args):
     return feats
 
 
+def measure_shift(batch, channels, device, reps):
+    """shift9 の旧（depthwise conv・one-hot の重み）と新（パディングと切り出し）の順伝播の速さ（局面/秒）。"""
+    import torch
+    import torch.nn.functional as F
+    from shikibu import dl_networks as N
+    x = torch.randn(batch, channels, 9, 9, device=device)
+    w = N._shift_kernel(channels).to(device)
+    funcs = [("旧 conv", lambda: F.conv2d(x, w, padding=1, groups=channels)),
+             ("新 切り出し", lambda: N.shift9(x))]
+    out = []
+    for label, fn in funcs:
+        for _ in range(3):
+            fn()
+        _sync(device)
+        t0 = time.perf_counter()
+        for _ in range(reps):
+            fn()
+        _sync(device)
+        out.append((label, batch * reps / (time.perf_counter() - t0)))
+    return out
+
+
+def measure_blocks(name, batch, device, reps):
+    """構造の中の各ブロック（順伝播＋逆伝播）の 1 呼び出しの時間（ms）。C・オプションは構造の名前のとおり。"""
+    import torch
+    from shikibu import dl_networks as N
+    spec = N.parse_dl(name)
+    c, o = spec["channels"], spec["options"]
+    out = []
+    for letter in dict.fromkeys(spec["trunk"] + spec["policy"].replace("0", "") + spec["value"].replace("0", "")):
+        blk = N.BLOCKS[letter](c, torch.nn.ReLU, o).to(device)
+        x = torch.randn(batch, c, 9, 9, device=device, requires_grad=True)
+        for _ in range(2):
+            blk(x).sum().backward()
+        _sync(device)
+        t0 = time.perf_counter()
+        for _ in range(reps):
+            blk(x).sum().backward()
+        _sync(device)
+        out.append((letter, (time.perf_counter() - t0) / reps * 1000))
+    return out
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", required=True, help="Shikibu のリポジトリ（python/ を import する）")
@@ -128,6 +171,9 @@ def main(argv=None):
     ap.add_argument("--amp", default="bf16", choices=["bf16", "fp16", "off"])
     ap.add_argument("--no-compile", action="store_true")
     ap.add_argument("--no-channels-last", action="store_true")
+    ap.add_argument("--networks", default="", help="測る構造の名前（カンマ区切り）。指定すると --presets より優先（M11.1）")
+    ap.add_argument("--blocks", action="store_true", help="ブロックごとの順伝播＋逆伝播の時間を測る（M11.1）")
+    ap.add_argument("--shift", action="store_true", help="shift9 の旧（depthwise conv）と新（切り出し）を比べる（M11.1）")
     args = ap.parse_args(argv)
     args.compile = not args.no_compile
     args.channels_last = not args.no_channels_last
@@ -159,7 +205,24 @@ def main(argv=None):
     except Exception as e:
         print(f"X 展開だけ：失敗（{e}）", flush=True)
 
-    for key in [s.strip() for s in args.presets.split(",") if s.strip()]:
+    if args.shift:
+        try:
+            for label, rate in measure_shift(args.batch, 192, device, reps=20):
+                print(f"S shift9 [{label}]（B={args.batch}, C=192）：{rate:,.0f} 局面/秒（順伝播のみ）", flush=True)
+        except Exception as e:
+            print(f"S shift9：失敗（{e}）", flush=True)
+
+    names = [s.strip() for s in args.networks.split(",") if s.strip()] or [
+        s.strip() for s in args.presets.split(",") if s.strip()]
+    if args.blocks:
+        for name in names:
+            try:
+                for letter, ms in measure_blocks(name, args.batch, device, reps=5):
+                    print(f"B 1 ブロック [{letter}] in {name}：{ms:.2f} ms/呼び出し（順伝播＋逆伝播、B={args.batch}）", flush=True)
+            except Exception as e:
+                print(f"B ブロック：失敗（{name}：{e}）", flush=True)
+
+    for key in names:
         name = dl_networks.PRESETS.get(key, key)
         try:
             rate, params = measure_train(name, x, args, device, eval_scale=600.0)

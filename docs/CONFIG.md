@@ -231,3 +231,71 @@ loss = CE(p, move; label_smoothing) + value_loss_scale × (value_mix_lambda × C
 ```
 
 検証の `value_mse` は `v`（Binned Value の期待値）と `sigmoid(score / eval_scale)` の差の 2 乗の平均です（hcpe は `score / 600`）。
+
+---
+
+## M11.1：組ごとの混ぜ方（`[[data.sources]]`）と hcpe・`require_move`
+
+### [[data.sources]]（組。`train_dl` だけ）
+
+指し手のあるデータと、評価値・勝敗だけのデータを、1 バッチに混ぜて学習するための設定です。組ごとに、方策・価値・勝敗を学ぶかを決めます。
+組が無ければ、`data.train_glob` を 1 つの組（PSV、3 つとも学ぶ、割合 1.0）として扱うので、M11 と同じ結果になります。
+
+| キー | 型 | 既定値 | 意味 |
+|---|---|---|---|
+| `name` | 文字列 | `"source0"` など | 表示とログの名前。組の中で重複しないこと |
+| `glob` | 文字列 | 必須 | 学習データ（glob）。`val_path` のファイルは学習から外す |
+| `format` | 文字列 | `"psv"` | `"psv"`（40 バイト）または `"hcpe"`（cshogi の 38 バイト） |
+| `weight` | 実数 | `1.0` | 1 バッチの中の割合（正の数。全部の組の合計で割る） |
+| `policy` | 真偽値 | `true` | この組の局面で方策を学ぶ。`true` なら指し手の無い局面は捨てる（`require_move = true`）。**`true` のときは、指し手のある局面が 1 つも無いと、学習を始める前に止まる** |
+| `value` | 真偽値 | `true` | この組の局面で価値（Binned Value）を学ぶ |
+| `result` | 真偽値 | `true` | この組の局面で勝敗（Result Head）を学ぶ |
+| `eval_scale` | 文字列または正の数 | `"auto"` | この組の評価値の尺度。`value = false` なら使わない。`"auto"` は組ごとに推定する（PSV は既存の推定、hcpe は先頭の局面から推定） |
+
+- 1 バッチの局面数：組 i は `round(weight_i / Σweight × batch_size)` を切り捨て、端数は最後の組が受け持つ（合計は `batch_size`）。どの組も 1 局面以上になること（小さすぎる `batch_size` は設定の誤り）。
+- 作業係の数（`num_threads`）とシャッフル窓（`shuffle_buffer`）は、重みで組に分ける（各組のスレッドは 1 以上）。
+- 周回は組ごとに進む（その組のファイルの順番だけ並べ替える）。checkpoint には組ごとの読み込み位置・周回・順番を保存し、`--resume` で全部の組を続きから読む。
+- 損失：項ごとに、その項を学ぶ局面だけで平均する（対象が 0 の項は 0）。`value = false` の組の局面は価値の損失に入らない。
+
+```toml
+[[data.sources]]
+name = "moves_hcpe"
+glob = "<指し手のあるデータ>/*.hcpe"
+format = "hcpe"
+weight = 0.5
+policy = true
+value = false
+result = true
+eval_scale = "auto"
+
+[[data.sources]]
+name = "big_psv"
+glob = "<評価値と勝敗だけのデータ>/*.psv"
+format = "psv"
+weight = 0.5
+policy = false
+value = true
+result = true
+eval_scale = "auto"
+```
+
+### `require_move`・`fmt`（`BatchLoader` の引数、Python から直接使うとき）
+
+| 引数 | 既定値 | 意味 |
+|---|---|---|
+| `output` | `"features"` | `"dl"` で詰めた局面（`fmt` を使える）。`"features"` は PSV だけ |
+| `fmt` | `"psv"` | `"hcpe"` で cshogi の hcpe（38 バイト）を読む（`output="dl"` のときだけ） |
+| `require_move` | `True` | `True` なら指し手の変換できない局面を捨てる。`False` なら `move = -1` のまま残す（捨てない） |
+
+読み解けないレコード・勝敗が範囲外のレコードは、どちらの場合も捨てます。捨てた数は `skipped()` の合計と、`skip_reasons()`（"unreadable"・"result_range"・"no_move"）で理由別に分かります。
+
+### 「使えないものが続く」ときの止め方
+
+読んだレコードが 100 万件続けて 1 局面も使えなかったら、待ち続けずに `RuntimeError` で止まります（理由の内訳つき）。
+`buffer_fill` の間は、30 秒ごとに「読んだ・使えた・理由別」を標準エラーと `log.jsonl`（`kind = "fill"`）に出します。
+
+### キャッシュ（`cache_dir`）
+
+- 組ごとに `cache_dir/src<番号>` のフォルダを使います（`BatchLoader` は作るとき、フォルダの `shk_cache_` のファイルを消すため、組どうしで共有しない）。
+- コピーが失敗したときは、理由と回数を標準エラーと `log.jsonl`（`kind = "cache_event"`）に出して、最大 3 回までやり直します。
+- DL のひな形の既定は `cache_dir = ""`（Drive から直接読む）。大きいデータを `cache_dir` で読むと、1 ファイルのコピーが終わるまで読み始められないので、待ち時間が長くなります。

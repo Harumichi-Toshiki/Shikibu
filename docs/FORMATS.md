@@ -347,3 +347,21 @@ PSV の 1 局面を、55 チャンネルの代わりに次の形で渡します�
 | `end` | 学習の終わり | `step`・`epoch`・`elapsed_sec`・`stopped_by`（`"max_steps"` または `"max_minutes"`） |
 
 `status.json` と `train.lock` の形は RayPair・HalfKP と同じです（§5・§5b）。段階の名前は `data_check`・`eval_scale`・`buffer_fill`・`train`・`done`・`error`。
+
+---
+
+## 9. hcpe（M11.1）
+
+cshogi の `HuffmanCodedPosAndEval`（1 レコード 38 バイト。`numpy` の dtype は `hcp u1 (32,)`・`eval <i2`・`bestMove16 <i2`・`gameResult i1`・`dummy u1`）。
+
+| 位置（バイト） | 内容 |
+|---|---|
+| 0〜31 | hcp（cshogi の `HuffmanCodedPos`）：手番 1 ビット、先手玉・後手玉の位置（各 7 ビット、マス番号は PackedSfen と同じ `(筋 − 1) × 9 + (段 − 1)`）、盤の 79 マスの符号、持ち駒と駒箱の符号を 256 ビットの終わりまで |
+| 32〜33 | 評価値（int16、手番側から見た値） |
+| 34〜35 | 指し手（cshogi の 16 ビット）：下位 7 ビットが移動先、次の 7 ビットが移動元（打つときは `81 + 駒`：歩 81・香 82・桂 83・銀 84・角 85・飛 86・金 87）、bit 14 が成り |
+| 36 | gameResult：0 引き分け、1 先手勝ち、2 後手勝ち（それ以外は範囲外） |
+| 37 | dummy |
+
+hcp の符号は PackedSfen（PSV）と**同じではありません**。盤の符号（例：歩 `1000`、と金 `1001`・後手の歩 `1010`）と持ち駒の符号は、cshogi の `set_hcp` と照らして表を作りました（`crates/shk_feat/src/position.rs` の `HCP_BOARD_CODES`・`HCP_HAND_CODES`）。21,470 局面で、`cshogi` の `set_hcp` と盤・持ち駒が一致することを確かめています。
+
+PSV と違う点の要約：指し手（cshogi の形、打つ駒の欄が 81 以上）、符号の表、勝敗（0・1・2）。
